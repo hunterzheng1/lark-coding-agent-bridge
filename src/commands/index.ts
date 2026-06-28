@@ -172,6 +172,7 @@ const handlers: Record<string, Handler> = {
   '/ps': handlePs,
   '/exit': handleExit,
   '/doctor': handleDoctor,
+  '/last': handleLast,
   '/reconnect': handleReconnect,
   '/doc': handleDoc,
   '/invite': handleInvite,
@@ -814,6 +815,31 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     chatMode: ctx.chatMode,
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+}
+
+async function handleLast(args: string, ctx: CommandContext): Promise<void> {
+  const n = parseLastN(args);
+  const text = ctx.sessions.getLastRunOutput(ctx.scope);
+  if (!text || !text.trim()) {
+    await reply(ctx, '本 session 暂无上一条 run 的结果。');
+    return;
+  }
+  const lines = text.split('\n');
+  const shown = Math.min(n, lines.length);
+  const tail = lines.slice(-n).join('\n');
+  const MAX_CHARS = 3000;
+  const capped = tail.length > MAX_CHARS ? tail.slice(-MAX_CHARS) : tail;
+  const truncated = tail.length > MAX_CHARS ? '（字符截断）' : '';
+  await reply(ctx, `上一条 run 最后 ${shown} 行${truncated}：\n\n${capped}`);
+}
+
+function parseLastN(args: string): number {
+  const DEFAULT = 20;
+  const trimmed = args.trim();
+  if (!trimmed) return DEFAULT;
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT;
+  return Math.min(n, 500);
 }
 
 function formatOwnerState(ctx: CommandContext): string {

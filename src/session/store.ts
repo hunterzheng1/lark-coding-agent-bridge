@@ -14,6 +14,8 @@ export interface SessionEntry {
    * scope, undefined = follow global default. Session resets preserve this
    * scope preference while removing the resumable session id/cwd. */
   idleTimeoutMinutes?: number;
+  /** Final agent text of the last completed run on this scope (for /last). */
+  lastRunOutput?: string;
 }
 
 type SessionMap = Record<string, SessionEntry>;
@@ -43,13 +45,16 @@ export class SessionStore {
         const cwd = typeof entry.cwd === 'string' ? entry.cwd : undefined;
         const idleTimeoutMinutes =
           typeof entry.idleTimeoutMinutes === 'number' ? entry.idleTimeoutMinutes : undefined;
+        const lastRunOutput =
+          typeof entry.lastRunOutput === 'string' ? entry.lastRunOutput : undefined;
         const hasSession = sessionId !== undefined && cwd !== undefined;
-        if (!hasSession && idleTimeoutMinutes === undefined) continue;
+        if (!hasSession && idleTimeoutMinutes === undefined && lastRunOutput === undefined) continue;
         this.data[chatId] = {
           ...(sessionId !== undefined ? { sessionId } : {}),
           ...(cwd !== undefined ? { cwd } : {}),
           updatedAt: entry.updatedAt,
           ...(idleTimeoutMinutes !== undefined ? { idleTimeoutMinutes } : {}),
+          ...(lastRunOutput !== undefined ? { lastRunOutput } : {}),
         };
       }
     } catch (err) {
@@ -85,6 +90,7 @@ export class SessionStore {
       ...(prev?.idleTimeoutMinutes !== undefined
         ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
         : {}),
+      ...(prev?.lastRunOutput !== undefined ? { lastRunOutput: prev.lastRunOutput } : {}),
     };
     this.schedulePersist();
   }
@@ -128,6 +134,21 @@ export class SessionStore {
     this.data[chatId] = { ...rest, updatedAt: Date.now() };
     this.schedulePersist();
     return true;
+  }
+
+  /** Final agent text of the last completed run on this scope (for /last). */
+  getLastRunOutput(chatId: string): string | undefined {
+    return this.data[chatId]?.lastRunOutput;
+  }
+
+  setLastRunOutput(chatId: string, text: string): void {
+    const prev = this.data[chatId];
+    this.data[chatId] = {
+      ...(prev ?? { updatedAt: Date.now() }),
+      lastRunOutput: text,
+      updatedAt: Date.now(),
+    };
+    this.schedulePersist();
   }
 
   async flush(): Promise<void> {

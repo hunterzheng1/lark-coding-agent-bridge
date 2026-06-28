@@ -784,6 +784,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     onTerminal: (state, elapsedMs, fullText, truncated) => {
       const mins = Math.max(1, Math.round(elapsedMs / 60_000));
       const toolCount = state.blocks.filter((b) => b.kind === 'tool').length;
+      if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
       void channel
         .send(
           chatId,
