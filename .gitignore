@@ -17,3 +17,10 @@ coverage/
 scripts/
 CHANGELOG.md
 tests-smoke/
+
+# AI / harness local metadata — local self-governance toolchain, not part of upstream open-source repo
+.claude/
+.harness/
+.codegraph/
+/CLAUDE.md
+/AGENTS.md
