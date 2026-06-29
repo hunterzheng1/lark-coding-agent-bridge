@@ -1,0 +1,4 @@
+# CLI bin entry must use LF line endings.
+# A CRLF shebang (#!/usr/bin/env node\r) is rejected by npm on publish
+# and the bin entry gets silently removed from the published package.
+bin/*.mjs text eol=lf
