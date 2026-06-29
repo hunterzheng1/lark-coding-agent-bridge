@@ -1,19 +1,19 @@
 {
-  "name": "lark-channel-bridge",
+  "name": "@hunterzheng/lark-channel-bridge",
   "version": "0.3.1",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zarazhangrui/feishu-claude-code-bridge.git"
+    "url": "git+https://github.com/hunterzheng1/lark-coding-agent-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/zarazhangrui/feishu-claude-code-bridge/issues"
+    "url": "https://github.com/hunterzheng1/lark-coding-agent-bridge/issues"
   },
-  "homepage": "https://github.com/zarazhangrui/feishu-claude-code-bridge#readme",
+  "homepage": "https://github.com/hunterzheng1/lark-coding-agent-bridge#readme",
   "bin": {
-    "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
+    "lark-channel-bridge": "bin/lark-channel-bridge.mjs"
   },
   "exports": {
     ".": {
@@ -79,5 +79,8 @@
     "channel",
     "bridge"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }
