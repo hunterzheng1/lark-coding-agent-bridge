@@ -136,16 +136,15 @@ async function createLegacyCodexConfig(options: {
     mkdir(workspace, { recursive: true }),
     mkdir(binDir, { recursive: true }),
   ]);
-  const codex = join(binDir, 'codex');
+  const codex = join(binDir, 'codex.mjs');
   await writeFile(
     codex,
     [
-      '#!/bin/sh',
-      'if [ "$1" = "--version" ]; then',
-      '  echo "codex-cli 999.0.0"',
-      '  exit 0',
-      'fi',
-      'exit 0',
+      '#!/usr/bin/env node',
+      'if (process.argv.includes("--version")) {',
+      '  console.log("codex-cli 999.0.0");',
+      '}',
+      'process.exit(0);',
       '',
     ].join('\n'),
     'utf8',
