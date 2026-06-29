@@ -27,9 +27,9 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 ## Install
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g @hunterzheng/lark-channel-bridge
 # or
-pnpm add -g lark-channel-bridge
+pnpm add -g @hunterzheng/lark-channel-bridge
 ```
 
 ## First run
@@ -109,7 +109,14 @@ lark-channel-bridge status --profile codex
 
 ```text
 lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+lark-channel-bridge start [--profile <name>] [--agent claude|codex] [--app-id <id>]
+lark-channel-bridge stop [--profile <name>]
+lark-channel-bridge restart [--profile <name>]
+lark-channel-bridge status [--profile <name>]
+lark-channel-bridge unregister [--profile <name>]
 lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge profile <list|create|use|remove|export>   # see below
+lark-channel-bridge secrets <get|set|list|remove>             # manage encrypted app secrets
 lark-channel-bridge ps
 lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
@@ -143,8 +150,10 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws use <name>` | Switch to a named workspace |
 | `/ws remove <name>` | Delete a named workspace |
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
+| `/last [N]` | Show the last N lines of the previous run's output (default 20) |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
+| `/account` | View or change app credentials via a card (`change`, `submit`, `cancel`) |
 | `/invite user @name` | Allow a user to use the bot in DMs |
 | `/invite admin @name` | Add an access-control admin |
 | `/invite group` | Allow the current group to use the bot |
@@ -156,6 +165,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/exit <id\|#>` | Stop a bridge process |
 | `/reconnect` | Force a WebSocket reconnect |
 | `/doctor [description]` | Run low-sensitive diagnostics |
+| `/doc` | Reminder: cloud-doc comments need no workspace binding; @bot in a supported doc to trigger |
 | `/help` | Help card |
 
 DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned.
@@ -325,7 +335,7 @@ LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
 That module receives every `log.*` event plus error/metric hooks and forwards them wherever you like. The interface is exported from the package root:
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from '@hunterzheng/lark-channel-bridge';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* ship event */},

@@ -27,9 +27,9 @@
 ## 安装
 
 ```bash
-npm i -g lark-channel-bridge
+npm i -g @hunterzheng/lark-channel-bridge
 # 或
-pnpm add -g lark-channel-bridge
+pnpm add -g @hunterzheng/lark-channel-bridge
 ```
 
 ## 首次启动
@@ -109,7 +109,14 @@ lark-channel-bridge status --profile codex
 
 ```text
 lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+lark-channel-bridge start [--profile <name>] [--agent claude|codex] [--app-id <id>]
+lark-channel-bridge stop [--profile <name>]
+lark-channel-bridge restart [--profile <name>]
+lark-channel-bridge status [--profile <name>]
+lark-channel-bridge unregister [--profile <name>]
 lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge profile <list|create|use|remove|export>   # 见下文
+lark-channel-bridge secrets <get|set|list|remove>             # 管理加密的 app secret
 lark-channel-bridge ps
 lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
@@ -143,8 +150,10 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/ws use <name>` | 切换到命名工作空间 |
 | `/ws remove <name>` | 删除命名工作空间 |
 | `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
+| `/last [N]` | 查看上一条 run 的最后 N 行输出（默认 20） |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
+| `/account` | 通过卡片查看或更换应用凭据（`change`、`submit`、`cancel`） |
 | `/invite user @某人` | 允许用户私聊使用 bot |
 | `/invite admin @某人` | 添加访问控制管理员 |
 | `/invite group` | 允许当前群使用 bot |
@@ -156,6 +165,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/exit <id\|#>` | 停止指定 bridge 进程 |
 | `/reconnect` | 强制 WebSocket 重连 |
 | `/doctor [描述]` | 执行低敏诊断 |
+| `/doc` | 提示：云文档评论无需绑定工作区，在支持的文档评论 @bot 即可触发 |
 | `/help` | 帮助卡片 |
 
 私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。支持的云文档评论里 @bot 就会触发回复。
@@ -325,7 +335,7 @@ LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
 该模块会收到每一条 `log.*` 事件，以及错误 / 指标钩子，转发到任何你想要的地方。接口从包根导出：
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from '@hunterzheng/lark-channel-bridge';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* 上报事件 */},
