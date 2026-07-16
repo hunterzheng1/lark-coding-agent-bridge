@@ -13,10 +13,14 @@ describe('SessionStore lastRunOutput', () => {
 
   async function fresh(path?: string): Promise<{ store: SessionStore; dir: string }> {
     const dir = await mkdtemp(join(tmpdir(), 'sess-last-'));
-    cleanups.push(async () => {
-      await rm(dir, { recursive: true, force: true });
-    });
     const store = new SessionStore(path ?? join(dir, 'sessions.json'));
+    // Flush in-flight atomic writes before deleting the temp dir. On Windows,
+    // removing the directory while persist is still chmod/rename-ing leaves
+    // files behind and afterEach fails with ENOTEMPTY.
+    cleanups.push(async () => {
+      await store.flush();
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    });
     await store.load();
     return { store, dir };
   }
