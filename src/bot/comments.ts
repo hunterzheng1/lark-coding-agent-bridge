@@ -64,6 +64,7 @@ export interface CommentContext {
    * we react on. Undefined when we couldn't pinpoint a reply (top-level
    * comment with no replies fetched, etc.). */
   targetReplyId?: string;
+  priorReplies?: string[];
 }
 
 export interface ExtractCommentQuestionInput {
@@ -330,6 +331,9 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             case 'text':
               answer += e.delta;
               break;
+            case 'final_text':
+              answer = e.content;
+              break;
             case 'tool_use':
             case 'tool_result':
               answer = '';
@@ -412,12 +416,30 @@ async function fetchCommentContext(
   const fetched = await channel.comments.fetch(target, evt.commentId);
   const replies = fetched?.replies ?? [];
   const parsed = extractCommentQuestionFromReplies({ replyId: evt.replyId, replies });
+  const targetIndex = parsed?.targetReplyId
+    ? replies.findIndex((reply) => reply.reply_id === parsed.targetReplyId)
+    : replies.length - 1;
+  const priorReplies = (targetIndex > 0 ? replies.slice(0, targetIndex) : [])
+    .map(replyElementsToText)
+    .filter((text) => text.length > 0);
   return {
     question: parsed?.question ?? '',
     quote: fetched?.quote,
     isWhole: Boolean(fetched?.isWhole),
     targetReplyId: parsed?.targetReplyId,
+    priorReplies,
   };
+}
+
+function replyElementsToText(reply: CommentReply): string {
+  return (reply.content?.elements ?? [])
+    .map((element) => {
+      if (element.type === 'text_run') return element.text_run?.text ?? '';
+      if (element.type === 'docs_link') return element.docs_link?.url ?? '';
+      return '';
+    })
+    .join('')
+    .trim();
 }
 
 export function extractCommentQuestionFromReplies(
@@ -430,15 +452,7 @@ export function extractCommentQuestionFromReplies(
   targetReply ??= input.replies.at(-1);
   if (!targetReply) return null;
 
-  const elements = targetReply.content?.elements ?? [];
-  const question = elements
-    .map((el) => {
-      if (el.type === 'text_run') return el.text_run?.text ?? '';
-      if (el.type === 'docs_link') return el.docs_link?.url ?? '';
-      return '';
-    })
-    .join('')
-    .trim();
+  const question = replyElementsToText(targetReply);
   return { question, targetReplyId: targetReply.reply_id };
 }
 
@@ -458,6 +472,13 @@ export function buildCommentPrompt(
   if (ctx.quote) {
     parts.push('');
     parts.push(`用户选中的原文：\n> ${ctx.quote.replace(/\n/g, '\n> ')}`);
+  }
+  if (ctx.priorReplies?.length) {
+    parts.push('');
+    parts.push('这条评论 thread 里此前的讨论（按时间顺序，@你的那条不在其中）：');
+    ctx.priorReplies.forEach((text, index) => {
+      parts.push(`${index + 1}. ${text}`);
+    });
   }
   parts.push('');
   parts.push(`用户的问题：${ctx.question}`);

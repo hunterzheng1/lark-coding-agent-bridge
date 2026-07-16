@@ -23,7 +23,9 @@ import type { WorkspaceStore } from '../workspace/store';
 export interface StartRunFlowInput {
   scopeId: string;
   scope: ScopeContext;
-  prompt: string;
+  prompt:
+    | string
+    | ((context: RunPromptContext) => string | Promise<string>);
   attachments: AgentAttachment[];
   access: AccessDecision;
   capability: AgentCapability;
@@ -40,6 +42,12 @@ export interface StartRunFlowInput {
     source: string;
     stage: string;
   };
+}
+
+export interface RunPromptContext {
+  cwdRealpath: string;
+  policyFingerprint: string;
+  resumeFrom?: string;
 }
 
 export type RunFlowRejectCode =
@@ -91,7 +99,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   const policy = evaluateRunPolicy({
     scope: input.scope,
     attachments: input.attachments,
-    prompt: input.prompt,
+    prompt: typeof input.prompt === 'string' ? input.prompt : '',
     requestedCwd,
     cwdRealpath: workspace.cwdRealpath,
     access: input.access,
@@ -112,7 +120,14 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   let resumeFrom: string | undefined;
   let sessionId: string | undefined;
   let threadId: string | undefined;
+  let hasCatalogIdentityVariant = false;
   if (input.sessionCatalog) {
+    hasCatalogIdentityVariant = input.sessionCatalog.entries().some(
+      (entry) =>
+        entry.scopeId === input.scopeId &&
+        entry.agentId === input.capability.agentId &&
+        entry.cwdRealpath === workspace.cwdRealpath,
+    );
     const catalogEntry = input.sessionCatalog.activeFor({
       scopeId: input.scopeId,
       agentId: input.capability.agentId,
@@ -127,7 +142,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       resumeFrom = threadId;
     }
   }
-  if (!resumeFrom && input.capability.agentId === 'claude') {
+  if (!resumeFrom && input.capability.agentId === 'claude' && !hasCatalogIdentityVariant) {
     resumeFrom = input.sessions.resumeFor(input.scopeId, workspace.cwdRealpath);
     sessionId = resumeFrom;
     const stale = input.sessions.getRaw(input.scopeId);
@@ -136,11 +151,21 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     }
   }
 
+  const prompt =
+    typeof input.prompt === 'string'
+      ? input.prompt
+      : await input.prompt({
+          cwdRealpath: workspace.cwdRealpath,
+          policyFingerprint: policy.policyFingerprint,
+          ...(resumeFrom ? { resumeFrom } : {}),
+        });
+  const effectivePolicy: RunPolicyAllow = { ...policy, prompt };
+
   let execution: RunExecution;
   try {
     execution = await input.executor.submit({
       scopeId: input.scopeId,
-      policy,
+      policy: effectivePolicy,
       sessionId,
       threadId,
       images:
@@ -175,7 +200,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
   return {
     ok: true,
     execution,
-    policy,
+    policy: effectivePolicy,
     cwdRealpath: workspace.cwdRealpath,
     ...(resumeFrom ? { resumeFrom } : {}),
   };

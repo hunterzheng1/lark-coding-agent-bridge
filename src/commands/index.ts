@@ -1232,6 +1232,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
                   continue;
                 }
                 if (evt.type === 'text') echoText += evt.delta;
+                if (evt.type === 'final_text') echoText = evt.content;
                 state = reduce(state, evt);
                 await flush();
                 // Don't wait for stdout to close — some claude versions hang
@@ -1258,6 +1259,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
           continue;
         }
         if (evt.type === 'text') echoText += evt.delta;
+        if (evt.type === 'final_text') echoText = evt.content;
         state = reduce(state, evt);
         if (state.terminal !== 'running') break;
       }

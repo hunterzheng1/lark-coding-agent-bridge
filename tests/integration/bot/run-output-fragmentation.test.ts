@@ -33,6 +33,7 @@ interface FakeStreamRecord {
   input: unknown;
   options: unknown;
   markdownContents: string[];
+  cardUpdates: unknown[];
 }
 
 interface FakeLarkChannel {
@@ -58,8 +59,8 @@ interface FakeLarkChannel {
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
-  send(chatId: string, content: unknown, options?: unknown): Promise<void>;
-  stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
+  send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
+  stream(chatId: string, input: unknown, options?: unknown): Promise<{ messageId: string }>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
 }
@@ -121,8 +122,119 @@ describe('run output fragmentation — markdown mode', () => {
 
     expect(h.channel.streams.length).toBeGreaterThan(0);
     const streamMd = h.channel.streams[0]!.markdownContents.at(-1) ?? '';
-    expect(streamMd).toContain(FINAL_REPLY);
+    expect(streamMd).not.toContain(FINAL_REPLY);
     expect(streamMd.length).toBeLessThan(NARRATION.length);
+    expect(h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY)).toBe(true);
+  });
+
+  it('delivers the final answer even when the progress stream fails', async () => {
+    const h = await createHarness('markdown', {
+      streamFailure: new Error('progress stream failed'),
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_stream_fail', 'do the thing'));
+    await waitFor(() => h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY));
+
+    expect(h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY)).toBe(true);
+  });
+
+  it('delivers the final answer when a live progress update fails', async () => {
+    const h = await createHarness('markdown', {
+      streamUpdateFailure: new Error('progress update failed'),
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_update_fail', 'do the thing'));
+    await waitFor(() => h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY));
+
+    expect(h.sessions.getLastRunOutput('oc_dm')).toBe(FULL_TEXT);
+  });
+
+  it('falls back to a visible Claude answer when a later progress update fails', async () => {
+    const claudeAnswer = 'claude final answer';
+    const h = await createHarness('markdown', {
+      agentKind: 'claude',
+      agentEvents: [
+        { type: 'text', delta: claudeAnswer },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      streamUpdateFailureAfter: 2,
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_claude_update_fail', 'do the thing'));
+    await waitFor(() => h.channel.sent.some((sent) => markdownOf(sent) === claudeAnswer));
+
+    expect(h.channel.sent.some((sent) => markdownOf(sent) === claudeAnswer)).toBe(true);
+  });
+
+  it('does not duplicate a Claude answer after a transient progress update failure recovers', async () => {
+    const claudeAnswer = 'claude recovered answer';
+    const h = await createHarness('markdown', {
+      agentKind: 'claude',
+      agentEvents: [
+        { type: 'text', delta: claudeAnswer },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      streamUpdateFailureOnceAt: 2,
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_claude_update_recovered', 'do the thing'));
+    await waitFor(() => h.channel.streams[0]?.markdownContents.at(-1) === claudeAnswer);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(h.channel.sent.some((sent) => markdownOf(sent) === claudeAnswer)).toBe(false);
+  });
+
+  it('does not let a stuck empty progress stream block the final answer', async () => {
+    const h = await createHarness('markdown', {
+      streamNeverSettles: true,
+      narration: '',
+      includeTools: false,
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_stream_stuck', 'do the thing'));
+    await waitFor(
+      () => h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY),
+      5000,
+    );
+
+    expect(h.channel.sent.some((sent) => markdownOf(sent) === FINAL_REPLY)).toBe(true);
+  });
+});
+
+describe('run output fragmentation — card mode', () => {
+  it('sends the reserved Codex final answer as a dedicated final card', async () => {
+    const h = await createHarness('card');
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_card', 'do the thing'));
+    await waitFor(() =>
+      h.channel.sent.some((sent) => JSON.stringify(sent.content).includes(FINAL_REPLY)),
+    );
+
+    const finalCard = h.channel.sent.find((sent) =>
+      JSON.stringify(sent.content).includes(FINAL_REPLY),
+    );
+    expect(finalCard?.content).toHaveProperty('card');
+    expect(h.sessions.getLastRunOutput('oc_dm')).toBe(FULL_TEXT);
+  });
+
+  it('adds a /last hint when the reserved final card is truncated', async () => {
+    const longFinal = 'F'.repeat(4500);
+    const h = await createHarness('card', { narration: 'short progress', finalReply: longFinal });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_long_final', 'do the thing'));
+    await waitFor(() =>
+      h.channel.sent.some((sent) => JSON.stringify(sent.content).includes('F'.repeat(100))),
+    );
+
+    expect(h.channel.sent.some((sent) => (markdownOf(sent) ?? '').includes('/last'))).toBe(true);
+    expect(h.sessions.getLastRunOutput('oc_dm')).toBe(`short progress${longFinal}`);
   });
 });
 
@@ -136,11 +248,26 @@ interface Harness {
   controls: ReturnType<typeof createControls>;
 }
 
-async function createHarness(replyMode: 'text' | 'markdown'): Promise<Harness> {
+async function createHarness(
+  replyMode: 'text' | 'markdown' | 'card',
+  options: {
+    streamFailure?: Error;
+    streamUpdateFailure?: Error;
+    streamNeverSettles?: boolean;
+    narration?: string;
+    finalReply?: string;
+    includeTools?: boolean;
+    agentKind?: 'claude' | 'codex';
+    agentEvents?: AgentEvent[];
+    streamUpdateFailureAfter?: number;
+    streamUpdateFailureOnceAt?: number;
+  } = {},
+): Promise<Harness> {
   const tmp = await createTmpProfile('run-output-fragmentation-');
   const workspace = await realpath(tmp.workspace);
+  const agentKind = options.agentKind ?? 'codex';
   const baseProfileConfig = createDefaultProfileConfig({
-    agentKind: 'codex',
+    agentKind,
     accounts: {
       app: {
         id: 'cli_test',
@@ -151,9 +278,7 @@ async function createHarness(replyMode: 'text' | 'markdown'): Promise<Harness> {
     access: {
       allowedUsers: ['ou_user'],
     },
-    codex: {
-      binaryPath: '/usr/local/bin/codex',
-    },
+    ...(agentKind === 'codex' ? { codex: { binaryPath: '/usr/local/bin/codex' } } : {}),
     preferences: {
       messageReply: replyMode,
       // Pre-0.1.27 `text` meant streaming markdown; set the migrated marker so
@@ -170,20 +295,23 @@ async function createHarness(replyMode: 'text' | 'markdown'): Promise<Harness> {
   };
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
+  const runEvents: AgentEvent[] = [
+    { type: 'text', delta: options.narration ?? NARRATION },
+    ...(options.includeTools === false
+      ? []
+      : [
+          { type: 'tool_use', id: '1', name: 'Bash', input: {} } as AgentEvent,
+          { type: 'tool_result', id: '1', output: 'ok', isError: false } as AgentEvent,
+        ]),
+    { type: 'final_text', content: options.finalReply ?? FINAL_REPLY },
+    { type: 'done', terminationReason: 'normal' },
+  ];
   const agent = new FakeAgentAdapter({
-    id: 'codex',
-    displayName: 'Codex',
-    events: [
-      [
-        { type: 'text', delta: NARRATION },
-        { type: 'tool_use', id: '1', name: 'Bash', input: {} },
-        { type: 'tool_result', id: '1', output: 'ok', isError: false },
-        { type: 'text', delta: FINAL_REPLY },
-        { type: 'done', terminationReason: 'normal' },
-      ] as AgentEvent[],
-    ],
+    id: agentKind,
+    displayName: agentKind === 'codex' ? 'Codex' : 'Claude Code',
+    events: [options.agentEvents ?? runEvents],
   });
-  const channel = createFakeLarkChannel();
+  const channel = createFakeLarkChannel(options);
   sdkMock.channel = channel;
   const controls = createControls(profileConfig);
   cleanups.push(async () => {
@@ -218,10 +346,30 @@ async function startTestBridge(h: {
   cleanups.push(() => bridge.disconnect());
 }
 
-function createFakeLarkChannel(): FakeLarkChannel {
+function createFakeLarkChannel(streamBehavior: {
+  streamFailure?: Error;
+  streamUpdateFailure?: Error;
+  streamUpdateFailureAfter?: number;
+  streamUpdateFailureOnceAt?: number;
+  streamNeverSettles?: boolean;
+}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
   const streams: FakeLarkChannel['streams'] = [];
+  let streamUpdateCount = 0;
+  const maybeFailStreamUpdate = (): void => {
+    streamUpdateCount++;
+    if (streamBehavior.streamUpdateFailure) throw streamBehavior.streamUpdateFailure;
+    if (streamUpdateCount === streamBehavior.streamUpdateFailureOnceAt) {
+      throw new Error('transient progress update failed');
+    }
+    if (
+      streamBehavior.streamUpdateFailureAfter !== undefined &&
+      streamUpdateCount >= streamBehavior.streamUpdateFailureAfter
+    ) {
+      throw new Error('progress update failed');
+    }
+  };
   const channel: FakeLarkChannel = {
     handlers,
     sent,
@@ -263,9 +411,16 @@ function createFakeLarkChannel(): FakeLarkChannel {
     },
     async send(chatId, content, options) {
       sent.push({ chatId, content, options });
+      return { messageId: `om_sent_${sent.length}` };
     },
     async stream(chatId, input, options) {
-      const record: FakeStreamRecord = { chatId, input, options, markdownContents: [] };
+      const record: FakeStreamRecord = {
+        chatId,
+        input,
+        options,
+        markdownContents: [],
+        cardUpdates: [],
+      };
       streams.push(record);
       const producer = (
         input as {
@@ -275,10 +430,31 @@ function createFakeLarkChannel(): FakeLarkChannel {
       if (producer) {
         await producer({
           setContent: async (markdown: string) => {
+            maybeFailStreamUpdate();
             record.markdownContents.push(markdown);
           },
         });
       }
+      const cardProducer = (
+        input as {
+          card?: {
+            producer?: (ctrl: { update(card: unknown): Promise<void> }) => Promise<void>;
+          };
+        }
+      ).card?.producer;
+      if (cardProducer) {
+        await cardProducer({
+          update: async (card: unknown) => {
+            maybeFailStreamUpdate();
+            record.cardUpdates.push(card);
+          },
+        });
+      }
+      if (streamBehavior.streamNeverSettles) {
+        return await new Promise<{ messageId: string }>(() => {});
+      }
+      if (streamBehavior.streamFailure) throw streamBehavior.streamFailure;
+      return { messageId: `om_stream_${streams.length}` };
     },
     async addReaction(messageId, emojiType) {
       const r = await channel.rawClient.im.v1.messageReaction.create({

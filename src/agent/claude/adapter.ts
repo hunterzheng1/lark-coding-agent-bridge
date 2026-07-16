@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import type { Readable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
 import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
@@ -20,7 +23,7 @@ export interface ClaudeAdapterOptions {
   larkChannel?: LarkChannelEnvContext;
 }
 
-type ClaudeChild = SpawnedProcessByStdio<null, Readable, Readable>;
+type ClaudeChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
 
 export class ClaudeAdapter implements AgentAdapter {
   readonly id = 'claude';
@@ -57,25 +60,31 @@ export class ClaudeAdapter implements AgentAdapter {
       throw new Error('cwd is required for ClaudeAdapter.run');
     }
 
+    const systemPromptFile = writeSystemPromptFile(buildBridgeSystemPrompt(this.botIdentity));
     const args = [
       '-p',
-      opts.prompt,
       '--output-format',
       'stream-json',
       '--verbose',
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
-      '--append-system-prompt',
-      buildBridgeSystemPrompt(this.botIdentity),
+      '--append-system-prompt-file',
+      systemPromptFile.path,
     ];
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     if (opts.model) args.push('--model', opts.model);
 
-    const child = spawnProcess(this.binary, args, {
-      cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) as ClaudeChild;
+    let child: ClaudeChild;
+    try {
+      child = spawnProcess(this.binary, args, {
+        cwd: opts.cwd,
+        env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }) as ClaudeChild;
+    } catch (err) {
+      systemPromptFile.cleanup();
+      throw err;
+    }
 
     log.info('agent', 'spawn', {
       pid: child.pid ?? null,
@@ -111,10 +120,16 @@ export class ClaudeAdapter implements AgentAdapter {
 
     child.on('error', (err) => {
       runtimeError = err;
+      systemPromptFile.cleanup();
     });
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
+      systemPromptFile.cleanup();
     });
+    child.stdin.on('error', (err) => {
+      log.warn('agent', 'stdin-error', { message: err.message });
+    });
+    child.stdin.end(opts.prompt, 'utf8');
 
     // Default 5s if caller didn't specify — claude often has live
     // subprocesses (lark-cli waiting for OAuth, long Bash, etc.) and the
@@ -166,6 +181,31 @@ export class ClaudeAdapter implements AgentAdapter {
       },
     };
   }
+}
+
+function writeSystemPromptFile(content: string): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), 'lark-claude-'));
+  const path = join(dir, 'append-system-prompt.md');
+  try {
+    writeFileSync(path, content, 'utf8');
+  } catch (err) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Preserve the original write failure.
+    }
+    throw err;
+  }
+  return {
+    path,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best effort: the OS will reclaim the temporary directory eventually.
+      }
+    },
+  };
 }
 
 async function* createEventStream(

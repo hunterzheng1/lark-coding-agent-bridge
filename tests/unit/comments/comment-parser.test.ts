@@ -38,6 +38,33 @@ describe('comment parser', () => {
     expect(result).toEqual({ question: 'second', targetReplyId: 'reply-2' });
   });
 
+  it('renders prior comment replies before the triggering question', () => {
+    const prompt = buildCommentPrompt(
+      { fileToken: 'doc-token', fileType: 'docx' },
+      {
+        question: 'share your view',
+        isWhole: false,
+        priorReplies: ['first concern', 'split it into two steps'],
+      },
+    );
+
+    expect(prompt).toContain('此前的讨论');
+    expect(prompt).toContain('1. first concern');
+    expect(prompt).toContain('2. split it into two steps');
+    expect(prompt.indexOf('first concern')).toBeLessThan(
+      prompt.indexOf('用户的问题：share your view'),
+    );
+  });
+
+  it('omits the prior discussion section when no earlier replies exist', () => {
+    const prompt = buildCommentPrompt(
+      { fileToken: 'doc-token', fileType: 'docx' },
+      { question: 'first question', isWhole: false, priorReplies: [] },
+    );
+
+    expect(prompt).not.toContain('此前的讨论');
+  });
+
   it('strips common markdown before writing back to comments', () => {
     expect(stripMarkdown('**bold** _italic_ `code`\n- item\n> quote')).toBe(
       'bold italic code\nitem\nquote',

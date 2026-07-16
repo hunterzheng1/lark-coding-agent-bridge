@@ -66,6 +66,49 @@ describe('processAgentStream — onTerminal + fullText (U11/U12)', () => {
     });
     expect(onTerminal.mock.calls[0]![2]).toBe(long);
   });
+
+  it('keeps draining events when a progress flush fails', async () => {
+    const handle = fakeHandle();
+    const evts: AgentEvent[] = [
+      { type: 'text', delta: 'progress' } as AgentEvent,
+      { type: 'final_text', content: 'final answer' } as AgentEvent,
+      { type: 'done', terminationReason: 'normal' } as AgentEvent,
+    ];
+    const flush = vi.fn().mockRejectedValueOnce(new Error('stream update failed'));
+    const onTerminal = vi.fn();
+
+    const state = await processAgentStream(
+      handle,
+      eventsFrom(evts),
+      'scope',
+      undefined,
+      noRecord,
+      flush,
+      { onTerminal },
+    );
+
+    expect(state.terminal).toBe('done');
+    expect(state.finalText).toBe('final answer');
+    expect(onTerminal).toHaveBeenCalledTimes(1);
+    expect(onTerminal.mock.calls[0]![2]).toBe('progressfinal answer');
+  });
+
+  it('marks an oversized reserved final answer as truncated', async () => {
+    const handle = fakeHandle();
+    const finalAnswer = 'F'.repeat(4500);
+    const evts: AgentEvent[] = [
+      { type: 'final_text', content: finalAnswer } as AgentEvent,
+      { type: 'done', terminationReason: 'normal' } as AgentEvent,
+    ];
+    const onTerminal = vi.fn();
+
+    await processAgentStream(handle, eventsFrom(evts), 'scope', undefined, noRecord, noFlush, {
+      onTerminal,
+    });
+
+    expect(onTerminal.mock.calls[0]![2]).toBe(finalAnswer);
+    expect(onTerminal.mock.calls[0]![3]).toBe(true);
+  });
 });
 
 describe('processAgentStream — heartbeat (U7/U9/U10)', () => {

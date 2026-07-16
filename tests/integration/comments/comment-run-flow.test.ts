@@ -66,6 +66,25 @@ describe('comment run flow', () => {
     expect(h.inThreadReplies).toEqual(['answer one']);
   });
 
+  it('includes earlier replies when the bot is mentioned later in a comment thread', async () => {
+    const h = await createHarness({
+      commentReplies: [
+        { reply_id: 'reply-a', text: 'first concern' },
+        { reply_id: 'reply-b', text: 'split it into two steps' },
+        { reply_id: 'reply-1', text: '@bot share your view' },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event()));
+
+    const prompt = h.agent.runOptions[0]?.prompt ?? '';
+    expect(prompt).toContain('first concern');
+    expect(prompt).toContain('split it into two steps');
+    expect(prompt).toContain('用户的问题：@bot share your view');
+    const prior = prompt.slice(prompt.indexOf('此前的讨论'), prompt.indexOf('用户的问题'));
+    expect(prior).not.toContain('share your view');
+  });
+
   it('shares Claude sessions across different comment threads in the same document', async () => {
     const h = await createHarness({
       agentTexts: ['first answer', 'second answer', 'third answer'],
@@ -197,6 +216,7 @@ async function createHarness(options: {
   sessionIds?: string[];
   threadIds?: string[];
   reactionFails?: boolean;
+  commentReplies?: Array<{ reply_id: string; text: string }>;
 } = {}): Promise<{
   tmp: TmpProfile;
   agent: FakeAgentAdapter;
@@ -226,7 +246,9 @@ async function createHarness(options: {
           : { sessionId: sessionIds[index] ?? `session-${index}` }),
         cwd: tmp.workspace,
       },
-      { type: 'text', delta: text },
+      agentKind === 'codex'
+        ? { type: 'final_text', content: text }
+        : { type: 'text', delta: text },
       {
         type: 'done',
         ...(agentKind === 'codex'
@@ -258,6 +280,20 @@ async function createHarness(options: {
           async get(input) {
             const commentId = input.path.comment_id;
             const replyId = commentId === 'comment-2' ? 'reply-2' : 'reply-1';
+            if (options.commentReplies && commentId === 'comment-1') {
+              return {
+                data: {
+                  reply_list: {
+                    replies: options.commentReplies.map((reply) => ({
+                      reply_id: reply.reply_id,
+                      content: {
+                        elements: [{ type: 'text_run', text_run: { text: reply.text } }],
+                      },
+                    })),
+                  },
+                },
+              };
+            }
             return commentGet(replyId, '@bot question');
           },
           async list() {
@@ -541,7 +577,7 @@ function codexRunWithProgress(threadId: string, progress: string, finalAnswer: s
       input: { command: 'lark-cli docs +fetch --api-version v2 --doc doc-token --doc-format markdown' },
     },
     { type: 'tool_result', id: `${threadId}-tool`, output: 'doc body', isError: false },
-    { type: 'text', delta: finalAnswer },
+    { type: 'final_text', content: finalAnswer },
     { type: 'done', threadId, terminationReason: 'normal' },
   ];
 }

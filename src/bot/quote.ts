@@ -11,6 +11,7 @@ export interface QuotedContext {
   messageId: string;
   senderId: string;
   senderName?: string;
+  senderType?: 'user' | 'bot';
   /** ISO timestamp of the quoted message's creation. Empty when SDK can't
    * resolve it from the fetched item. */
   createdAt: string;
@@ -95,6 +96,22 @@ export async function fetchQuotedContext(
     }
   };
 
+  return normalizeItemToQuoted(channel, parent, fetchSubMessages);
+}
+
+function mapSenderType(raw: unknown): 'user' | 'bot' | undefined {
+  if (raw === 'user') return 'user';
+  if (raw === 'app' || raw === 'bot') return 'bot';
+  return undefined;
+}
+
+async function normalizeItemToQuoted(
+  channel: LarkChannel,
+  parent: ApiMessageItem,
+  fetchSubMessages: (messageId: string) => Promise<ApiMessageItem[]>,
+): Promise<QuotedContext | undefined> {
+  if (!parent.message_id) return undefined;
+
   const senderOpenId = parent.sender?.id;
   const fakeRaw: RawMessageEvent = {
     sender: { sender_id: { open_id: senderOpenId } },
@@ -126,6 +143,7 @@ export async function fetchQuotedContext(
       messageId: parent.message_id,
       senderId: senderOpenId ?? '',
       senderName: normalized.senderName,
+      senderType: mapSenderType(parent.sender?.sender_type),
       createdAt: Number.isFinite(createMs) && createMs > 0
         ? new Date(createMs).toISOString()
         : '',
@@ -136,10 +154,99 @@ export async function fetchQuotedContext(
     };
   } catch (err) {
     log.warn('quote', 'normalize-failed', {
-      messageId,
+      messageId: parent.message_id,
       err: err instanceof Error ? err.message : String(err),
     });
     return undefined;
+  }
+}
+
+export async function fetchTopicContext(
+  channel: LarkChannel,
+  threadId: string,
+  opts: { maxMessages: number; excludeIds?: Set<string> },
+): Promise<QuotedContext[]> {
+  const collected: ApiMessageItem[] = [];
+  const seenMessageIds = new Set<string>();
+  const seenPageTokens = new Set<string>();
+  const excludeIds = opts.excludeIds ?? new Set<string>();
+  let pageToken: string | undefined;
+  try {
+    do {
+      const response = await channel.rawClient.im.v1.message.list({
+        params: {
+          container_id_type: 'thread',
+          container_id: threadId,
+          sort_type: 'ByCreateTimeDesc',
+          page_size: 50,
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+      const data = (response as {
+        data?: {
+          items?: ApiMessageItem[];
+          messages?: ApiMessageItem[];
+          has_more?: boolean;
+          page_token?: string;
+        };
+      }).data;
+      for (const item of data?.items ?? data?.messages ?? []) {
+        const messageId = item.message_id;
+        if (
+          !messageId ||
+          seenMessageIds.has(messageId) ||
+          excludeIds.has(messageId) ||
+          (item as { deleted?: boolean }).deleted
+        ) {
+          continue;
+        }
+        seenMessageIds.add(messageId);
+        collected.push(item);
+        if (collected.length >= opts.maxMessages) break;
+      }
+      const nextPageToken = data?.has_more ? data.page_token : undefined;
+      if (!nextPageToken || seenPageTokens.has(nextPageToken)) {
+        pageToken = undefined;
+      } else {
+        seenPageTokens.add(nextPageToken);
+        pageToken = nextPageToken;
+      }
+    } while (pageToken && collected.length < opts.maxMessages);
+  } catch (err) {
+    log.warn('topic', 'context-fetch-failed', {
+      threadId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  const relevant = collected.slice(0, opts.maxMessages).reverse();
+
+  const result: QuotedContext[] = [];
+  for (const item of relevant) {
+    const fetchSubMessages = async (messageId: string): Promise<ApiMessageItem[]> => {
+      const items =
+        messageId === item.message_id
+          ? [item]
+          : await safeFetchRaw(channel, messageId);
+      return items.map(preExpandInteractive);
+    };
+    const normalized = await normalizeItemToQuoted(channel, item, fetchSubMessages);
+    if (normalized) result.push(normalized);
+  }
+  return result;
+}
+
+async function safeFetchRaw(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<ApiMessageItem[]> {
+  try {
+    return await channel.fetchRawMessage(messageId, {
+      cardContentType: 'user_card_content',
+    });
+  } catch {
+    return [];
   }
 }
 

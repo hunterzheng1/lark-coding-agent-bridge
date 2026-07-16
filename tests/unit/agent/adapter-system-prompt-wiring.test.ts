@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -45,31 +47,51 @@ beforeEach(() => {
 });
 
 describe('ClaudeAdapter system prompt wiring', () => {
-  it('appends the identity-aware bridge system prompt after setBotIdentity', () => {
-    spawnMock.spawnProcess.mockReturnValue(fakeChild());
+  it('appends the identity-aware bridge system prompt via a temp file after setBotIdentity', async () => {
+    const child = fakeChild();
+    spawnMock.spawnProcess.mockReturnValue(child);
     const adapter = new ClaudeAdapter();
     adapter.setBotIdentity({ openId: 'ou_bot_self', name: 'Bridge' });
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
-    const flagIndex = args.indexOf('--append-system-prompt');
-    expect(flagIndex).toBeGreaterThan(-1);
-    expect(args[flagIndex + 1]).toBe(
+    expect(await readAll(child.stdin)).toBe('hi');
+    expect(systemPromptFileContent()).toBe(
       buildBridgeSystemPrompt({ openId: 'ou_bot_self', name: 'Bridge' }),
     );
   });
 
-  it('falls back to the base system prompt when no identity was set', () => {
-    spawnMock.spawnProcess.mockReturnValue(fakeChild());
+  it('falls back to the base system prompt when no identity was set', async () => {
+    const child = fakeChild();
+    spawnMock.spawnProcess.mockReturnValue(child);
     const adapter = new ClaudeAdapter();
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
-    const flagIndex = args.indexOf('--append-system-prompt');
-    expect(args[flagIndex + 1]).toBe(buildBridgeSystemPrompt(undefined));
+    expect(await readAll(child.stdin)).toBe('hi');
+    expect(systemPromptFileContent()).toBe(buildBridgeSystemPrompt(undefined));
   });
+
+  it('removes the temporary system prompt when spawn throws synchronously', () => {
+    spawnMock.spawnProcess.mockImplementation(() => {
+      throw new Error('spawn failed');
+    });
+    const adapter = new ClaudeAdapter();
+
+    expect(() => adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' })).toThrow('spawn failed');
+
+    const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
+    const flagIndex = args.indexOf('--append-system-prompt-file');
+    expect(existsSync(dirname(args[flagIndex + 1] as string))).toBe(false);
+  });
+
+  function systemPromptFileContent(): string {
+    const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
+    const flagIndex = args.indexOf('--append-system-prompt-file');
+    expect(flagIndex).toBeGreaterThan(-1);
+    expect(args).not.toContain('--append-system-prompt');
+    return readFileSync(args[flagIndex + 1] as string, 'utf8');
+  }
 });
 
 describe('CodexAdapter system prompt wiring', () => {

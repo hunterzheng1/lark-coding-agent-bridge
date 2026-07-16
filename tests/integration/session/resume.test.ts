@@ -109,6 +109,7 @@ describe('agent-aware run-flow resume', () => {
       sessionId: 'sess-stale',
       now: 1000,
     });
+    h.sessions.set('chat-1', 'sess-stale', first.cwdRealpath);
 
     const second = await start(h);
 
