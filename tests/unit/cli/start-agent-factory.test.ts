@@ -93,8 +93,22 @@ describe('start runtime agent factory', () => {
     expect(releaseIndex).toBeLessThan(exitIndex);
   });
 
+  it('creates CodeBuddyAdapter for codebuddy profiles', () => {
+    const agent = createRuntimeAgent(
+      createDefaultProfileConfig({
+        agentKind: 'codebuddy',
+        accounts: appAccount(),
+      }),
+      { profileDir: tmpdir() },
+    );
+
+    expect(agent.id).toBe('codebuddy');
+    expect(agent.displayName).toBe('CodeBuddy Code');
+  });
+
   it('rejects reconnect when a profile changes agent kind in place', () => {
     expect(() => assertReconnectAgentKindUnchanged('claude', 'codex')).toThrow(/agent kind/i);
+    expect(() => assertReconnectAgentKindUnchanged('claude', 'codebuddy')).toThrow(/agent kind/i);
     expect(() => assertReconnectAgentKindUnchanged('codex', 'codex')).not.toThrow();
   });
 });

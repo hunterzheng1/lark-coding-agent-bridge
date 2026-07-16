@@ -24,3 +24,7 @@ tests-smoke/
 .codegraph/
 /CLAUDE.md
 /AGENTS.md
+
+# CodeBuddy CLI local workspace artifacts
+.codebuddy/
+/CODEBUDDY.md

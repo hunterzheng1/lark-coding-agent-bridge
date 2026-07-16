@@ -1,6 +1,6 @@
 # lark-channel-bridge
 
-A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
+A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code, Codex CLI, or CodeBuddy Code. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
 [中文 README](./README.zh.md)
 
@@ -22,6 +22,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - At least one local agent installed and logged in:
   - Claude Code: `claude`, see https://docs.anthropic.com/en/docs/claude-code/quickstart
   - Codex CLI: `codex`, see https://developers.openai.com/codex/cli
+  - CodeBuddy Code: `codebuddy` (alias `cbc`). Override binary with `LARK_CHANNEL_CODEBUDDY_BIN`.
 - A Feishu / Lark **PersonalAgent** app. The first-run QR wizard can create and bind one for you.
 
 ## Install
@@ -94,6 +95,7 @@ By default, the bridge starts with the currently selected profile. Use `profile 
 ```bash
 lark-channel-bridge start --profile claude --agent claude
 lark-channel-bridge start --profile codex --agent codex
+lark-channel-bridge start --profile codebuddy --agent codebuddy
 ```
 
 For example, to restart only the Codex bot:
@@ -108,13 +110,13 @@ lark-channel-bridge status --profile codex
 ### Host CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge start [--profile <name>] [--agent claude|codex] [--app-id <id>]
+lark-channel-bridge run [--profile <name>] [--agent claude|codex|codebuddy] [--workspace <path>] [-c <config>]
+lark-channel-bridge start [--profile <name>] [--agent claude|codex|codebuddy] [--app-id <id>]
 lark-channel-bridge stop [--profile <name>]
 lark-channel-bridge restart [--profile <name>]
 lark-channel-bridge status [--profile <name>]
 lark-channel-bridge unregister [--profile <name>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge migrate [--profile <name>] [--agent claude|codex|codebuddy]
 lark-channel-bridge profile <list|create|use|remove|export>   # see below
 lark-channel-bridge secrets <get|set|list|remove>             # manage encrypted app secrets
 lark-channel-bridge ps
@@ -127,6 +129,7 @@ lark-channel-bridge --help
 ```bash
 lark-channel-bridge profile create claude --agent claude
 lark-channel-bridge profile create codex --agent codex
+lark-channel-bridge profile create codebuddy --agent codebuddy
 lark-channel-bridge profile list
 lark-channel-bridge profile use <name>
 lark-channel-bridge profile remove <name>
@@ -149,7 +152,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws save <name>` | Save the current working directory as a named workspace |
 | `/ws use <name>` | Switch to a named workspace |
 | `/ws remove <name>` | Delete a named workspace |
-| `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
+| `/resume` | Resume compatible history for the same agent, working directory, and permission mode. CodeBuddy continues via catalog `sessionId`; browsing CodeBuddy's native history directory is not supported yet (candidate list may be empty). |
 | `/last [N]` | Show the last N lines of the previous run's output (default 20) |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
@@ -304,7 +307,7 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 
 ## FAQ
 
-**The bot stays silent or the local CLI never replies.** Usually the local `claude` or `codex` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
+**The bot stays silent or the local CLI never replies.** Usually the local `claude`, `codex`, or `codebuddy` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
 
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
 

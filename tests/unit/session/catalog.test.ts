@@ -64,6 +64,46 @@ describe('agent-aware session catalog', () => {
     await catalog.flush();
   });
 
+  it('isolates codebuddy session entries from claude under the same scope and cwd', async () => {
+    const catalog = new SessionCatalog(await path());
+
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'claude',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp-1',
+      sessionId: 'sess-claude',
+      now: 1000,
+    });
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codebuddy',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp-1',
+      sessionId: 'sess-codebuddy',
+      now: 2000,
+    });
+
+    expect(
+      catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'claude',
+        cwdRealpath: '/repo',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ sessionId: 'sess-claude', agentId: 'claude' });
+    expect(
+      catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'codebuddy',
+        cwdRealpath: '/repo',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ sessionId: 'sess-codebuddy', agentId: 'codebuddy' });
+    expect(catalog.entries()).toHaveLength(2);
+    await catalog.flush();
+  });
+
   it('rejects mismatched Claude/Codex identity fields and does not auto-resume damaged entries', async () => {
     const catalog = new SessionCatalog(await path());
 

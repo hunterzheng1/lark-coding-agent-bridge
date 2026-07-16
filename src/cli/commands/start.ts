@@ -4,10 +4,12 @@ import { createInterface } from 'node:readline';
 import pkg from '../../../package.json';
 import { ClaudeAdapter } from '../../agent/claude/adapter';
 import { CodexAdapter } from '../../agent/codex/adapter';
+import { CodeBuddyAdapter } from '../../agent/codebuddy/adapter';
 import {
   AgentPreflightError,
   formatAgentPreflightDiagnostic,
   type AgentAvailability,
+  type LocalAgentId,
 } from '../../agent/preflight';
 import type { AgentAdapter } from '../../agent/types';
 import { startChannel, type BridgeChannel } from '../../bot/channel';
@@ -370,13 +372,17 @@ export async function runStart(opts: StartOptions): Promise<void> {
 
 async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promise<AgentAvailability> {
   if (agent.checkAvailability) return agent.checkAvailability();
+  // Fallback for adapters without checkAvailability (none of the built-in
+  // adapters hit this path today). `command` uses the agent id, which may
+  // differ from an env-overridden binary path (review FB-002).
   const ok = await agent.isAvailable();
   if (ok) return { ok: true };
+  const agentId = (agent.id === 'codex' || agent.id === 'codebuddy' ? agent.id : 'claude') as LocalAgentId;
   const diagnostic = {
     code: 'agent-binary-not-found' as const,
-    agentId: agent.id === 'codex' ? 'codex' as const : 'claude' as const,
+    agentId,
     agentName: agent.displayName,
-    command: agent.id === 'codex' ? 'codex' : 'claude',
+    command: agentId,
   };
   return {
     ok: false,
@@ -433,6 +439,9 @@ export function createRuntimeAgent(
       sandbox: profileConfig.sandbox.defaultMode,
       larkChannel,
     });
+  }
+  if (profileConfig.agentKind === 'codebuddy') {
+    return new CodeBuddyAdapter({ larkChannel });
   }
   return new ClaudeAdapter({ larkChannel });
 }

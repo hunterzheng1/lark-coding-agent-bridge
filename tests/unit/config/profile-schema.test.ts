@@ -537,4 +537,25 @@ describe('profile schema', () => {
       maxAccess: 'workspace',
     });
   });
+
+  it('accepts codebuddy agentKind without a codex configuration section', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'codebuddy',
+      accounts: { app },
+    });
+
+    expect(cfg.agentKind).toBe('codebuddy');
+    expect(cfg.codex).toBeUndefined();
+  });
+
+  it('rejects unsupported agentKind values with a tri-state message', () => {
+    expect(() =>
+      normalizeProfileConfig({
+        schemaVersion: 2,
+        agentKind: 'foo',
+        accounts: { app },
+      }),
+    ).toThrow(/agentKind must be claude, codex, or codebuddy/);
+  });
 });
