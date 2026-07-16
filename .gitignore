@@ -22,6 +22,10 @@ tests-smoke/
 .claude/
 .harness/
 .codegraph/
+.agents/
+.codex/
+.cursor/
+/.mcp.json
 /CLAUDE.md
 /AGENTS.md
 
