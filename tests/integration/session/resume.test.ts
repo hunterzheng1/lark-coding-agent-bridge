@@ -1,7 +1,7 @@
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { claudeCapability, codexCapability } from '../../../src/agent/capability.js';
+import { claudeCapability, codebuddyCapability, codexCapability } from '../../../src/agent/capability.js';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { ProcessPool } from '../../../src/bot/process-pool.js';
 import {
@@ -47,6 +47,33 @@ describe('agent-aware run-flow resume', () => {
     expect(second.resumeFrom).toBe('sess-catalog');
     expect(h.agent.runOptions[1]).toMatchObject({
       sessionId: 'sess-catalog',
+      threadId: undefined,
+    });
+  });
+
+  it('resumes CodeBuddy sessionId from catalog like Claude', async () => {
+    const h = await createHarness('codebuddy');
+    const first = await start(h);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected initial run');
+    await collect(first.execution.subscribe());
+
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codebuddy',
+      cwdRealpath: first.cwdRealpath,
+      policyFingerprint: first.policy.policyFingerprint,
+      sessionId: 'sess-codebuddy',
+      now: 1000,
+    });
+
+    const second = await start(h);
+
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error('expected resumed run');
+    expect(second.resumeFrom).toBe('sess-codebuddy');
+    expect(h.agent.runOptions[1]).toMatchObject({
+      sessionId: 'sess-codebuddy',
       threadId: undefined,
     });
   });
@@ -148,6 +175,32 @@ describe('agent-aware run-flow resume', () => {
     ).toMatchObject({ sessionId: 'sess-recorded' });
     expect(claude.sessions.resumeFor('chat-1', claudeRun.cwdRealpath)).toBe('sess-recorded');
 
+    const codebuddy = await createHarness('codebuddy');
+    const codebuddyRun = await start(codebuddy);
+    expect(codebuddyRun.ok).toBe(true);
+    if (!codebuddyRun.ok) throw new Error('expected codebuddy run');
+    await collect(codebuddyRun.execution.subscribe());
+
+    recordRunSessionEvent({
+      scopeId: 'chat-1',
+      sessions: codebuddy.sessions,
+      sessionCatalog: codebuddy.catalog,
+      capability: codebuddyCapability(codebuddy.profileConfig),
+      policy: codebuddyRun.policy,
+      event: { type: 'system', sessionId: 'sess-codebuddy-recorded', cwd: codebuddyRun.cwdRealpath },
+    });
+
+    expect(
+      codebuddy.catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'codebuddy',
+        cwdRealpath: codebuddyRun.cwdRealpath,
+        policyFingerprint: codebuddyRun.policy.policyFingerprint,
+      }),
+    ).toMatchObject({ sessionId: 'sess-codebuddy-recorded' });
+    // CodeBuddy must not leak into Claude legacy SessionStore.
+    expect(codebuddy.sessions.getRaw('chat-1')).toBeUndefined();
+
     const codex = await createHarness('codex');
     const codexRun = await start(codex);
     expect(codexRun.ok).toBe(true);
@@ -175,7 +228,7 @@ describe('agent-aware run-flow resume', () => {
   });
 });
 
-async function createHarness(agentKind: 'claude' | 'codex'): Promise<{
+async function createHarness(agentKind: 'claude' | 'codex' | 'codebuddy'): Promise<{
   tmp: TmpProfile;
   agent: FakeAgentAdapter;
   executor: RunExecutor;
@@ -248,7 +301,9 @@ async function start(h: Awaited<ReturnType<typeof createHarness>>) {
     capability:
       h.profileConfig.agentKind === 'codex'
         ? codexCapability(h.profileConfig)
-        : claudeCapability(h.profileConfig),
+        : h.profileConfig.agentKind === 'codebuddy'
+          ? codebuddyCapability(h.profileConfig)
+          : claudeCapability(h.profileConfig),
     profileConfig: h.profileConfig,
     sessions: h.sessions,
     sessionCatalog: h.catalog,
