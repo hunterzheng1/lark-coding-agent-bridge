@@ -58,6 +58,9 @@ export class CodeBuddyAdapter implements AgentAdapter {
     }
 
     // CodeBuddy rejects --append-system-prompt-file; inject inline.
+    // On Windows, a multiline --append-system-prompt value can break parsing of
+    // any argv that follows it (CreateProcess quoting). Put --resume/--model
+    // before the multiline prompt so session continuity survives.
     const args = [
       '-p',
       '--output-format',
@@ -65,11 +68,10 @@ export class CodeBuddyAdapter implements AgentAdapter {
       '--verbose',
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
-      '--append-system-prompt',
-      buildBridgeSystemPrompt(this.botIdentity),
     ];
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     if (opts.model) args.push('--model', opts.model);
+    args.push('--append-system-prompt', buildBridgeSystemPrompt(this.botIdentity));
 
     const child = spawnProcess(this.binary, args, {
       cwd: opts.cwd,

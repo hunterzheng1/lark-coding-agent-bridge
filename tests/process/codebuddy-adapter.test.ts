@@ -72,7 +72,7 @@ describe('CodeBuddyAdapter process contract', () => {
     expect(record.argv).not.toContain('--model');
   });
 
-  it('passes resume and model after the base CLI contract', async () => {
+  it('passes resume and model before the multiline append-system-prompt', async () => {
     const fake = await createFakeCodeBuddy({
       lines: [{ type: 'result', session_id: 'sess-resumed' }],
     });
@@ -90,7 +90,18 @@ describe('CodeBuddyAdapter process contract', () => {
       { type: 'done', sessionId: 'sess-resumed', terminationReason: 'normal' },
     ]);
     const record = await readRecord(fake.recordPath);
-    expect(record.argv.slice(-4)).toEqual(['--resume', 'sess-old', '--model', 'glm-5.2']);
+    const resumeAt = record.argv.indexOf('--resume');
+    const modelAt = record.argv.indexOf('--model');
+    const appendAt = record.argv.indexOf('--append-system-prompt');
+    expect(record.argv.slice(resumeAt, resumeAt + 4)).toEqual([
+      '--resume',
+      'sess-old',
+      '--model',
+      'glm-5.2',
+    ]);
+    expect(resumeAt).toBeGreaterThan(-1);
+    expect(modelAt).toBeGreaterThan(resumeAt);
+    expect(appendAt).toBeGreaterThan(modelAt);
   });
 
   it('requires cwd before spawning', () => {
