@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  normalizeCatalogCwd,
   SessionCatalog,
   sessionCatalogKey,
 } from '../../../src/session/catalog.js';
@@ -23,6 +24,56 @@ describe('agent-aware session catalog', () => {
         policyFingerprint: 'fp-1',
       }),
     ).toBe('chat-1\x1fclaude\x1f/repo\x1ffp-1');
+  });
+
+  it('normalizes Windows cwd casing for catalog keys', () => {
+    expect(normalizeCatalogCwd('C:\\Users\\A', 'win32')).toBe('c:\\users\\a');
+    expect(normalizeCatalogCwd('c:\\Users\\A', 'win32')).toBe('c:\\users\\a');
+    expect(normalizeCatalogCwd('/repo', 'linux')).toBe('/repo');
+  });
+
+  it('treats Windows drive-letter casing as the same catalog identity', async () => {
+    if (process.platform !== 'win32') return;
+
+    const catalog = new SessionCatalog(await path());
+
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codebuddy',
+      cwdRealpath: 'c:\\Users\\WINDOWS\\.lark-channel-workspaces\\codebuddy\\default',
+      policyFingerprint: 'fp-1',
+      sessionId: 'sess-lower',
+      now: 1000,
+    });
+
+    expect(
+      catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'codebuddy',
+        cwdRealpath: 'C:\\Users\\WINDOWS\\.lark-channel-workspaces\\codebuddy\\default',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ sessionId: 'sess-lower', agentId: 'codebuddy' });
+
+    // Overwrite via Node-style capital drive letter should hit the same slot.
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codebuddy',
+      cwdRealpath: 'C:\\Users\\WINDOWS\\.lark-channel-workspaces\\codebuddy\\default',
+      policyFingerprint: 'fp-1',
+      sessionId: 'sess-upper',
+      now: 2000,
+    });
+    expect(catalog.entries().filter((e) => e.agentId === 'codebuddy')).toHaveLength(1);
+    expect(
+      catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'codebuddy',
+        cwdRealpath: 'c:\\Users\\WINDOWS\\.lark-channel-workspaces\\codebuddy\\default',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ sessionId: 'sess-upper' });
+    await catalog.flush();
   });
 
   it('stores Claude sessions and Codex threads in isolated active entries', async () => {

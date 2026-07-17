@@ -16,7 +16,7 @@ import {
 } from '../policy/workspace';
 import type { RunExecution, RunExecutor } from '../runtime/run-executor';
 import { RunRejected, type RunRejectedCode } from '../runtime/errors';
-import type { SessionCatalog } from '../session/catalog';
+import { normalizeCatalogCwd, type SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 
@@ -126,7 +126,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       (entry) =>
         entry.scopeId === input.scopeId &&
         entry.agentId === input.capability.agentId &&
-        entry.cwdRealpath === workspace.cwdRealpath,
+        normalizeCatalogCwd(entry.cwdRealpath) === normalizeCatalogCwd(workspace.cwdRealpath),
     );
     const catalogEntry = input.sessionCatalog.activeFor({
       scopeId: input.scopeId,
@@ -212,7 +212,9 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
     (input.capability.agentId === 'claude' || input.capability.agentId === 'codebuddy') &&
     input.event.sessionId
   ) {
-    const cwdRealpath = input.event.cwd ?? input.policy.cwdRealpath;
+    // Always key catalog by policy cwd (Node realpath). Agent-reported cwd can
+    // differ by drive-letter casing on Windows (CodeBuddy emits `c:\...`).
+    const cwdRealpath = input.policy.cwdRealpath;
     // Legacy SessionStore is Claude-only; CodeBuddy resumes exclusively via catalog.
     if (input.capability.agentId === 'claude') {
       input.sessions.set(input.scopeId, input.event.sessionId, cwdRealpath);

@@ -47,11 +47,20 @@ const DEFAULT_MAX_ENTRIES_PER_SCOPE = 20;
 const DEFAULT_MAX_ENTRIES_PER_PROFILE = 1000;
 const KEY_SEPARATOR = '\x1f';
 
+/**
+ * Catalog identity must be stable across agent-reported vs Node realpath casing.
+ * On Windows, CodeBuddy may emit `c:\...` while `fs.realpath` returns `C:\...`.
+ */
+export function normalizeCatalogCwd(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== 'win32') return cwd;
+  return cwd.toLowerCase();
+}
+
 export function sessionCatalogKey(input: SessionCatalogIdentity): string {
   return [
     input.scopeId,
     input.agentId,
-    input.cwdRealpath,
+    normalizeCatalogCwd(input.cwdRealpath),
     input.policyFingerprint,
   ].join(KEY_SEPARATOR);
 }
@@ -76,7 +85,9 @@ export class SessionCatalog {
       for (const item of raw) {
         const entry = normalizeEntry(item);
         if (!entry) continue;
-        this.data.set(entry.key, entry);
+        // Re-key so Windows drive-letter casing variants collapse to one identity.
+        const key = sessionCatalogKey(entry);
+        this.data.set(key, { ...entry, key });
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
@@ -240,7 +251,7 @@ function matchesIdentity(entry: SessionCatalogEntry, input: SessionCatalogIdenti
   return (
     entry.scopeId === input.scopeId &&
     entry.agentId === input.agentId &&
-    entry.cwdRealpath === input.cwdRealpath &&
+    normalizeCatalogCwd(entry.cwdRealpath) === normalizeCatalogCwd(input.cwdRealpath) &&
     entry.policyFingerprint === input.policyFingerprint &&
     entry.key === sessionCatalogKey(input)
   );
