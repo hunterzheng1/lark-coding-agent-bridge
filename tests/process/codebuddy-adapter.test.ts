@@ -143,6 +143,41 @@ describe('CodeBuddyAdapter process contract', () => {
     expect(availability.diagnostic.agentId).toBe('codebuddy');
     expect(availability.diagnostic.code).toBe('agent-binary-not-found');
   });
+
+  it('closes the event stream when the CodeBuddy process exits but a descendant keeps stdout open', async () => {
+    const fake = await createFakeCodeBuddy({
+      lines: [{ type: 'system', subtype: 'status', status: null }],
+      lingerMs: 1500,
+      shellWrapper: true,
+    });
+    cleanup.push(fake.dir);
+
+    const run = new CodeBuddyAdapter({ binary: fake.path }).run({
+      runId: 'run-inherited-stdout',
+      prompt: 'hello',
+      cwd: fake.dir,
+      stopGraceMs: 100,
+    });
+
+    const events = collect(run.events);
+    await waitForRecord(fake.recordPath);
+    const fakePid = (await readRecord(fake.recordPath)).pid;
+    await run.stop();
+
+    const settled = await Promise.race([
+      events.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+
+    try {
+      process.kill(fakePid, 'SIGTERM');
+    } catch {
+      // The fixed stream may outlive the short fake process on fast machines.
+    }
+    await events;
+
+    expect(settled).toBe(true);
+  });
 });
 
 async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
@@ -155,12 +190,17 @@ async function createFakeCodeBuddy(options: {
   lines: unknown[];
   stderr?: string;
   exitCode?: number;
+  lingerMs?: number;
+  shellWrapper?: boolean;
 }): Promise<FakeBinary> {
   const dir = await mkdtemp(join(tmpdir(), 'codebuddy-adapter-test-'));
-  const path = join(dir, 'fake-codebuddy.mjs');
+  const runnerPath = join(dir, 'fake-codebuddy.mjs');
+  const path = options.shellWrapper
+    ? join(dir, process.platform === 'win32' ? 'fake-codebuddy.cmd' : 'fake-codebuddy.sh')
+    : runnerPath;
   const recordPath = join(dir, 'argv.json');
   await writeFile(
-    path,
+    runnerPath,
     [
       '#!/usr/bin/env node',
       'import { writeFileSync } from "node:fs";',
@@ -171,6 +211,7 @@ async function createFakeCodeBuddy(options: {
       'process.stdin.on("data", (chunk) => { stdin += chunk; });',
       'process.stdin.on("end", () => {',
       `  writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({`,
+      '    pid: process.pid,',
       '    argv,',
       '    stdin,',
       '    systemPrompt,',
@@ -182,18 +223,41 @@ async function createFakeCodeBuddy(options: {
       `  const lines = ${JSON.stringify(options.lines)};`,
       '  for (const line of lines) console.log(JSON.stringify(line));',
       options.stderr ? `  process.stderr.write(${JSON.stringify(options.stderr)});` : '',
-      `  process.exit(${options.exitCode ?? 0});`,
+      options.lingerMs
+        ? `  setTimeout(() => process.exit(${options.exitCode ?? 0}), ${options.lingerMs});`
+        : `  process.exit(${options.exitCode ?? 0});`,
       '});',
     ]
       .filter(Boolean)
       .join('\n'),
     'utf8',
   );
-  await chmod(path, 0o755);
+  await chmod(runnerPath, 0o755);
+  if (options.shellWrapper) {
+    const wrapper =
+      process.platform === 'win32'
+        ? `@echo off\r\n"${process.execPath}" "${runnerPath}" %*\r\n`
+        : `#!/bin/sh\n"${process.execPath}" "${runnerPath}" "$@"\n`;
+    await writeFile(path, wrapper, 'utf8');
+    await chmod(path, 0o755);
+  }
   return { path, dir, recordPath };
 }
 
+async function waitForRecord(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      await readFile(path);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error(`fake CodeBuddy did not start: ${path}`);
+}
+
 async function readRecord(path: string): Promise<{
+  pid: number;
   argv: string[];
   stdin: string;
   systemPrompt: string | null;
@@ -201,6 +265,7 @@ async function readRecord(path: string): Promise<{
   env: { LARK_CHANNEL?: string };
 }> {
   return JSON.parse(await readFile(path, 'utf8')) as {
+    pid: number;
     argv: string[];
     stdin: string;
     systemPrompt: string | null;

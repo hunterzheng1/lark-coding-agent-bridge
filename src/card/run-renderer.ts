@@ -16,10 +16,23 @@ type Group = ToolGroup | TextGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
+  progress?: RunCardProgress;
+}
+
+export interface RunCardProgress {
+  elapsedMs: number;
+  idleMs: number;
+  currentTool?: string;
+  completedTools: number;
+  inFlightTools: number;
 }
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
+
+  if (state.terminal === 'running' && options.progress) {
+    elements.push(progressStatus(options.progress));
+  }
 
   if (state.reasoning.content) {
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));
@@ -199,6 +212,23 @@ function footerStatus(status: Exclude<FooterStatus, null>): object {
         ? '🧰 正在调用工具'
         : '✍️ 正在输出';
   return noteMd(text);
+}
+
+function progressStatus(progress: RunCardProgress): object {
+  const activity =
+    progress.currentTool && progress.inFlightTools > 0
+      ? `🧰 当前工具 ${progress.currentTool}`
+      : '🟢 进程仍在运行';
+  const content = [
+    `⏳ 运行中 · 已 ${formatMinutes(progress.elapsedMs)} · 静默 ${formatMinutes(progress.idleMs)}`,
+    `${activity} · 已完成 ${progress.completedTools} 个工具`,
+  ].join('\n');
+  return noteMd(content);
+}
+
+function formatMinutes(ms: number): string {
+  if (ms < 60_000) return '<1m';
+  return `${Math.floor(ms / 60_000)}m`;
 }
 
 function summaryText(state: RunState): string {

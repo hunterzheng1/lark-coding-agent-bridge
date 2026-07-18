@@ -189,17 +189,23 @@ async function* createEventStream(
   }
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  let sawStdout = false;
-  let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
-  const closeSilentStdout = (): void => {
-    silentExitTimer = setTimeout(() => {
-      if (!sawStdout && !child.stdout.readableEnded) child.stdout.destroy();
+  let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
+  const closeInheritedStdout = (): void => {
+    // On Windows the spawned process can be a .cmd shim. Killing that shim may
+    // leave its Node child alive with an inherited copy of the stdout handle.
+    // The process has already exited, so give readline a short drain window and
+    // then close our readable even if earlier output was received. Otherwise
+    // the async iterator (and the run heartbeat) can remain alive indefinitely.
+    exitDrainTimer = setTimeout(() => {
+      if (!child.stdout.readableEnded) {
+        rl.close();
+        child.stdout.destroy();
+      }
     }, 50);
   };
-  child.once('exit', closeSilentStdout);
+  child.once('exit', closeInheritedStdout);
   try {
     for await (const line of rl) {
-      sawStdout = true;
       const trimmed = line.trim();
       if (!trimmed) continue;
       let parsed: unknown;
@@ -211,8 +217,8 @@ async function* createEventStream(
       yield* translateEvent(parsed);
     }
   } finally {
-    if (silentExitTimer) clearTimeout(silentExitTimer);
-    child.removeListener('exit', closeSilentStdout);
+    if (exitDrainTimer) clearTimeout(exitDrainTimer);
+    child.removeListener('exit', closeInheritedStdout);
     rl.close();
   }
 

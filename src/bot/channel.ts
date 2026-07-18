@@ -17,7 +17,8 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
-import { renderCard } from '../card/run-renderer';
+import { renderCard, type RunCardProgress } from '../card/run-renderer';
+import { ResilientCardUpdater } from '../card/resilient-updater';
 import {
   buildTerminalNotice,
   finalizeIfRunning,
@@ -807,16 +808,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });
 
-  // Heartbeat / completion / full-result hooks — independent plain messages
-  // so the user sees progress and outcome even if the card stream stalls.
+  // Completion/full-result hook. Silent-period heartbeats are rendered back
+  // into the active progress surface by processAgentStream instead of posting
+  // separate chat messages.
   const hooks: StreamHooks = {
-    onHeartbeat: (elapsedMs, currentTool) => {
-      const mins = Math.max(1, Math.round(elapsedMs / 60_000));
-      const toolPart = currentTool ? ` · 当前工具 ${currentTool}` : '';
-      void channel
-        .send(chatId, { markdown: `⏳ 运行中 · 已 ${mins}m${toolPart}` }, sendOpts)
-        .catch((err) => log.fail('stream', err, { step: 'heartbeat' }));
-    },
     onTerminal: (state, elapsedMs, fullText, truncated) => {
       const mins = Math.max(1, Math.round(elapsedMs / 60_000));
       const toolCount = state.blocks.filter((b) => b.kind === 'tool').length;
@@ -862,22 +857,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   try {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
+      let latestProgress: RunCardProgress = {
+        elapsedMs: 0,
+        idleMs: 0,
+        completedTools: 0,
+        inFlightTools: 0,
+      };
       let producerStarted = false;
       let progressUpdateFailed = false;
       let fallbackSent = false;
-      let cardCtrl:
-        | { update(next: object | ((current: object) => object)): Promise<void> }
-        | undefined;
+      let cardAttached = false;
+      const renderProgressCard = (state: RunState, progress: RunCardProgress): object =>
+        renderCard(filterForPrefs(state), { ...cardRenderOptions, progress });
+      const cardUpdater = new ResilientCardUpdater({
+        sendSuccessor: (card) => channel.send(chatId, { card }, sendOpts),
+        updateMessage: (messageId, card) => channel.updateCard(messageId, card),
+        onRollover: (previousMessageId, nextMessageId) => {
+          log.warn('stream', 'card-rollover', {
+            previousMessageId: previousMessageId ?? null,
+            nextMessageId,
+          });
+        },
+      });
       const renderDone = processAgentStream(
         handle,
         eventStream,
         scope,
         idleTimeoutMs,
         recordSession,
-        async (state) => {
+        async (state, progress) => {
           latestState = state;
-          if (cardCtrl) {
-            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+          latestProgress = progress;
+          if (cardAttached) {
+            await cardUpdater.update(renderProgressCard(state, progress));
           }
         },
         {
@@ -895,7 +907,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (renderText(filterForPrefs(state)).trim() === '') return;
         await channel.send(
           chatId,
-          { card: renderCard(filterForPrefs(state), cardRenderOptions) },
+          { card: renderProgressCard(state, latestProgress) },
           sendOpts,
         );
         fallbackSent = true;
@@ -904,11 +916,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         chatId,
         {
           card: {
-            initial: renderCard(initialState, cardRenderOptions),
+            initial: renderProgressCard(initialState, latestProgress),
             producer: async (ctrl) => {
               producerStarted = true;
-              cardCtrl = ctrl;
-              await ctrl.update(renderCard(filterForPrefs(latestState), cardRenderOptions));
+              cardAttached = true;
+              cardUpdater.attachPrimary(ctrl.messageId, (card) => ctrl.update(card));
+              await cardUpdater.update(renderProgressCard(latestState, latestProgress));
               await renderDone;
             },
           },
@@ -1120,7 +1133,7 @@ const WINDOW_OPTS: WindowOptions = { maxTools: 8, maxTextChars: 4000 };
 const HEARTBEAT_INTERVAL_MS = 3 * 60_000;
 
 export interface StreamHooks {
-  onHeartbeat?: (elapsedMs: number, currentTool: string | undefined) => void;
+  onHeartbeat?: (elapsedMs: number, currentTool: string | undefined) => void | Promise<void>;
   onTerminal?: (state: RunState, elapsedMs: number, fullText: string, truncated: boolean) => void;
   onFlushError?: (error: unknown) => void;
   onFlushSuccess?: () => void;
@@ -1133,17 +1146,33 @@ export async function processAgentStream(
   scope: string,
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
-  flush: (state: RunState) => Promise<void>,
+  flush: (state: RunState, progress: RunCardProgress) => Promise<void>,
   hooks?: StreamHooks,
 ): Promise<RunState> {
   const runStart = Date.now();
+  let lastActivityAt = runStart;
   let state: RunState = initialState;
   let fullText = '';
   let currentTool: string | undefined;
+  let completedTools = 0;
+  const inFlightTools = new Set<string>();
   let flushFailureLogged = false;
+  let flushQueue: Promise<unknown> = Promise.resolve();
+  const progressSnapshot = (): RunCardProgress => {
+    const now = Date.now();
+    return {
+      elapsedMs: now - runStart,
+      idleMs: now - lastActivityAt,
+      ...(currentTool ? { currentTool } : {}),
+      completedTools,
+      inFlightTools: inFlightTools.size,
+    };
+  };
   const safeFlush = async (nextState: RunState): Promise<void> => {
+    const queued = flushQueue.then(() => flush(nextState, progressSnapshot()));
+    flushQueue = queued.catch(() => undefined);
     try {
-      await flush(nextState);
+      await queued;
       try {
         hooks?.onFlushSuccess?.();
       } catch (hookErr) {
@@ -1178,7 +1207,6 @@ export async function processAgentStream(
   //  - any non-tool event arrives while the set is empty.
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
-  const inFlightTools = new Set<string>();
   const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
@@ -1199,21 +1227,26 @@ export async function processAgentStream(
   // (unlike idle watchdog, which pauses during in-flight tools). Gives the
   // user a progress signal during long silent tool calls.
   let heartbeatTimer: NodeJS.Timeout | undefined;
+  let heartbeatClosed = false;
   const heartbeatMs = hooks?.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
   const armHeartbeat = (): void => {
-    if (!hooks?.onHeartbeat) return;
+    if (!hooks || heartbeatClosed) return;
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
-      try {
-        hooks.onHeartbeat?.(Date.now() - runStart, currentTool);
-      } catch (err) {
-        log.fail('stream', err, { step: 'heartbeat' });
-      }
-      armHeartbeat();
+      heartbeatTimer = undefined;
+      void (async () => {
+        await safeFlush(windowState(state, WINDOW_OPTS));
+        try {
+          await hooks.onHeartbeat?.(Date.now() - runStart, currentTool);
+        } catch (err) {
+          log.fail('stream', err, { step: 'heartbeat' });
+        }
+        armHeartbeat();
+      })();
     }, heartbeatMs);
   };
   const resetHeartbeat = (): void => {
-    if (!hooks?.onHeartbeat) return;
+    if (!hooks) return;
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     armHeartbeat();
   };
@@ -1222,6 +1255,7 @@ export async function processAgentStream(
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+      lastActivityAt = Date.now();
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result
@@ -1234,7 +1268,8 @@ export async function processAgentStream(
           inFlight: inFlightTools.size,
         });
       } else if (evt.type === 'tool_result') {
-        inFlightTools.delete(evt.id);
+        if (inFlightTools.delete(evt.id)) completedTools += 1;
+        if (inFlightTools.size === 0) currentTool = undefined;
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
       }
       armOrPauseIdle();
@@ -1275,6 +1310,7 @@ export async function processAgentStream(
     }
   } finally {
     if (timer) clearTimeout(timer);
+    heartbeatClosed = true;
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
   }
 

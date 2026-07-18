@@ -100,6 +100,25 @@ describe('run card renderer snapshots', () => {
     });
   });
 
+  it('renders durable progress telemetry on a running card', () => {
+    const card = JSON.stringify(
+      renderCard(initialState, {
+        progress: {
+          elapsedMs: 12 * 60_000,
+          idleMs: 4 * 60_000,
+          currentTool: 'Bash',
+          completedTools: 3,
+          inFlightTools: 1,
+        },
+      }),
+    );
+
+    expect(card).toContain('已 12m');
+    expect(card).toContain('静默 4m');
+    expect(card).toContain('Bash');
+    expect(card).toContain('已完成 3 个工具');
+  });
+
   it('keeps local paths in user-visible cards and text fallbacks', () => {
     const sensitivePath = '/Users/example/private/customer/repo/secret.txt';
     const state = stateFrom([

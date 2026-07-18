@@ -112,6 +112,44 @@ describe('processAgentStream — onTerminal + fullText (U11/U12)', () => {
 });
 
 describe('processAgentStream — heartbeat (U7/U9/U10)', () => {
+  it('refreshes the current state with progress metadata during a silent gap', async () => {
+    vi.useFakeTimers();
+    try {
+      const handle = fakeHandle();
+      let resolveGap: () => void = () => {};
+      const gap = new Promise<void>((resolve) => {
+        resolveGap = resolve;
+      });
+      async function* gen(): AsyncIterable<AgentEvent> {
+        yield { type: 'tool_use', id: '1', name: 'Bash', input: {} } as AgentEvent;
+        await gap;
+        yield { type: 'done', terminationReason: 'normal' } as AgentEvent;
+      }
+      const flush = vi.fn().mockResolvedValue(undefined);
+      const promise = processAgentStream(handle, gen(), 'scope', undefined, noRecord, flush, {
+        heartbeatIntervalMs: 100,
+      });
+
+      await vi.advanceTimersByTimeAsync(250);
+
+      const heartbeatProgress = flush.mock.calls.at(-1)?.[1];
+      expect(flush.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(heartbeatProgress).toMatchObject({
+        currentTool: 'Bash',
+        completedTools: 0,
+        inFlightTools: 1,
+      });
+      expect(heartbeatProgress.elapsedMs).toBeGreaterThanOrEqual(200);
+      expect(heartbeatProgress.idleMs).toBeGreaterThanOrEqual(200);
+
+      resolveGap();
+      await vi.advanceTimersByTimeAsync(50);
+      await promise;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('fires onHeartbeat during a silent gap with current tool, clears on terminal', async () => {
     vi.useFakeTimers();
     try {
