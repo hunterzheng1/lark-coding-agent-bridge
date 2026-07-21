@@ -185,7 +185,9 @@ export function secretKeyForApp(appId: string): string {
  * (which sets `messageReplyMigrated: true`), we map their `text` →
  * `markdown` so the behavior stays the same after upgrade.
  *
- * Default for fresh configs (no `messageReply` set) is `'markdown'`.
+ * Default for fresh configs (no `messageReply` set) is `'card'`, so long
+ * runs get CardKit streaming renew by default. Explicit `markdown` / `text`
+ * preferences are unchanged.
  */
 export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
   const raw = cfg.preferences?.messageReply;
@@ -193,7 +195,7 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
     return 'markdown';
   }
   if (raw === 'card' || raw === 'markdown' || raw === 'text') return raw;
-  return 'markdown';
+  return 'card';
 }
 
 /** Resolve the show-tool-calls preference with default fallback. */
