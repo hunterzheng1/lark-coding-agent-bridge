@@ -41,9 +41,17 @@ interface FakeLarkChannel {
   handlers: MessageHandlerMap;
   sent: Array<{ chatId: string; content: unknown; options?: unknown }>;
   streams: FakeStreamRecord[];
+  cardkitRequests: Array<{ method: string; params: unknown }>;
   rawClient: {
     request: ReturnType<typeof vi.fn>;
     application: { v6: { application: { get: ReturnType<typeof vi.fn> } } };
+    cardkit: {
+      v1: {
+        card: {
+          settings: (params: unknown) => Promise<unknown>;
+        };
+      };
+    };
     im: {
       v1: {
         message: { get: ReturnType<typeof vi.fn> };
@@ -59,6 +67,9 @@ interface FakeLarkChannel {
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
+  createCard(cardJson: unknown): Promise<{ cardId: string }>;
+  updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void>;
+  updateCard(messageId: string, card: unknown): Promise<void>;
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<{ messageId: string }>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
@@ -236,6 +247,108 @@ describe('run output fragmentation — card mode', () => {
     expect(h.channel.sent.some((sent) => (markdownOf(sent) ?? '').includes('/last'))).toBe(true);
     expect(h.sessions.getLastRunOutput('oc_dm')).toBe(`short progress${longFinal}`);
   });
+
+  it('INT-001: drives progress via CardKit updateCardById and closes streaming_mode', async () => {
+    const h = await createHarness('card', {
+      agentKind: 'claude',
+      narration: 'progress line',
+      finalReply: '',
+      includeTools: true,
+      agentEvents: [
+        { type: 'text', delta: 'progress line' },
+        { type: 'tool_use', id: '1', name: 'Bash', input: { command: 'echo hi' } },
+        { type: 'tool_result', id: '1', output: 'hi', isError: false },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_cardkit', 'run tools'));
+    await waitFor(() =>
+      h.channel.cardkitRequests.some((r) => r.method === 'cardkit.v1.card.settings'),
+    );
+
+    expect(h.channel.streams).toHaveLength(0);
+    expect(h.channel.cardkitRequests.some((r) => r.method === 'cardkit.v1.card.create')).toBe(true);
+    expect(h.channel.cardkitRequests.some((r) => r.method === 'cardkit.v1.card.update')).toBe(true);
+    const closeSettings = h.channel.cardkitRequests
+      .filter((r) => r.method === 'cardkit.v1.card.settings')
+      .map((r) => {
+        const data = (r.params as { data?: { settings?: string } }).data?.settings;
+        return data ? (JSON.parse(data) as { config?: { streaming_mode?: boolean } }) : undefined;
+      })
+      .find((parsed) => parsed?.config?.streaming_mode === false);
+    expect(closeSettings).toBeDefined();
+  });
+
+  it('INT-003: recovers from updateCardById 200850 via settings renew', async () => {
+    const h = await createHarness('card', {
+      agentKind: 'claude',
+      narration: 'progress line',
+      finalReply: '',
+      includeTools: true,
+      streamUpdateFailureOnceAt: 1,
+      streamUpdateFailureOnce: Object.assign(new Error('Card streaming timeout'), { code: 200850 }),
+      agentEvents: [
+        { type: 'text', delta: 'progress line' },
+        { type: 'tool_use', id: '1', name: 'Bash', input: { command: 'echo hi' } },
+        { type: 'tool_result', id: '1', output: 'hi', isError: false },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_renew', 'run tools'));
+    await waitFor(() =>
+      h.channel.cardkitRequests.some((r) => {
+        if (r.method !== 'cardkit.v1.card.settings') return false;
+        const data = (r.params as { data?: { settings?: string } }).data?.settings;
+        if (!data) return false;
+        const parsed = JSON.parse(data) as { config?: { streaming_mode?: boolean } };
+        return parsed.config?.streaming_mode === true;
+      }),
+    );
+    await waitFor(() =>
+      h.channel.cardkitRequests.some((r) => {
+        if (r.method !== 'cardkit.v1.card.settings') return false;
+        const data = (r.params as { data?: { settings?: string } }).data?.settings;
+        if (!data) return false;
+        const parsed = JSON.parse(data) as { config?: { streaming_mode?: boolean } };
+        return parsed.config?.streaming_mode === false;
+      }),
+    );
+
+    const updates = h.channel.cardkitRequests.filter((r) => r.method === 'cardkit.v1.card.update');
+    expect(updates.length).toBeGreaterThanOrEqual(2);
+    // Primary session recovered; no successor card send for a transient streaming error.
+    expect(h.channel.sent.filter((s) => 'card' in (s.content as object)).length).toBeLessThanOrEqual(
+      1,
+    );
+  });
+
+  it('Y3: CardKit createCard failure falls back to a visible progress card', async () => {
+    const h = await createHarness('card', {
+      agentKind: 'claude',
+      narration: 'visible progress',
+      finalReply: '',
+      includeTools: false,
+      createCardFailure: new Error('cardkit unavailable'),
+      agentEvents: [
+        { type: 'text', delta: 'visible progress' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_create_fail', 'go'));
+    await waitFor(() =>
+      h.channel.sent.some((s) => JSON.stringify(s.content).includes('visible progress')),
+    );
+
+    expect(h.channel.cardkitRequests.some((r) => r.method === 'cardkit.v1.card.create')).toBe(true);
+    expect(h.channel.cardkitRequests.some((r) => r.method === 'cardkit.v1.card.update')).toBe(false);
+    expect(h.channel.sent.some((s) => 'card' in (s.content as object))).toBe(true);
+  });
 });
 
 interface Harness {
@@ -261,6 +374,8 @@ async function createHarness(
     agentEvents?: AgentEvent[];
     streamUpdateFailureAfter?: number;
     streamUpdateFailureOnceAt?: number;
+    streamUpdateFailureOnce?: Error;
+    createCardFailure?: Error;
   } = {},
 ): Promise<Harness> {
   const tmp = await createTmpProfile('run-output-fragmentation-');
@@ -351,17 +466,24 @@ function createFakeLarkChannel(streamBehavior: {
   streamUpdateFailure?: Error;
   streamUpdateFailureAfter?: number;
   streamUpdateFailureOnceAt?: number;
+  streamUpdateFailureOnce?: Error;
   streamNeverSettles?: boolean;
+  createCardFailure?: Error;
 }): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
   const streams: FakeLarkChannel['streams'] = [];
+  const cardkitRequests: FakeLarkChannel['cardkitRequests'] = [];
+  const cardById = new Map<string, unknown>();
+  let nextCard = 1;
   let streamUpdateCount = 0;
   const maybeFailStreamUpdate = (): void => {
     streamUpdateCount++;
     if (streamBehavior.streamUpdateFailure) throw streamBehavior.streamUpdateFailure;
     if (streamUpdateCount === streamBehavior.streamUpdateFailureOnceAt) {
-      throw new Error('transient progress update failed');
+      throw (
+        streamBehavior.streamUpdateFailureOnce ?? new Error('transient progress update failed')
+      );
     }
     if (
       streamBehavior.streamUpdateFailureAfter !== undefined &&
@@ -374,6 +496,7 @@ function createFakeLarkChannel(streamBehavior: {
     handlers,
     sent,
     streams,
+    cardkitRequests,
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
@@ -383,6 +506,16 @@ function createFakeLarkChannel(streamBehavior: {
             get: vi.fn(async () => ({
               data: { app: { owner: { owner_id: 'ou_owner' } } },
             })),
+          },
+        },
+      },
+      cardkit: {
+        v1: {
+          card: {
+            async settings(params: unknown) {
+              cardkitRequests.push({ method: 'cardkit.v1.card.settings', params });
+              return {};
+            },
           },
         },
       },
@@ -409,8 +542,34 @@ function createFakeLarkChannel(streamBehavior: {
     getConnectionStatus() {
       return { state: 'connected', reconnectAttempts: 0 };
     },
+    async createCard(cardJson) {
+      cardkitRequests.push({ method: 'cardkit.v1.card.create', params: { cardJson } });
+      if (streamBehavior.createCardFailure) throw streamBehavior.createCardFailure;
+      const cardId = `card_fake_${nextCard++}`;
+      cardById.set(cardId, cardJson);
+      return { cardId };
+    },
+    async updateCardById(cardId, cardJson, sequence) {
+      maybeFailStreamUpdate();
+      cardById.set(cardId, cardJson);
+      cardkitRequests.push({
+        method: 'cardkit.v1.card.update',
+        params: { cardId, cardJson, sequence },
+      });
+    },
+    async updateCard(messageId, card) {
+      cardkitRequests.push({
+        method: 'im.v1.message.patch',
+        params: { messageId, card },
+      });
+    },
     async send(chatId, content, options) {
-      sent.push({ chatId, content, options });
+      const cardId = (content as { cardId?: unknown } | undefined)?.cardId;
+      const resolved =
+        typeof cardId === 'string' && cardById.has(cardId)
+          ? { card: cardById.get(cardId) }
+          : content;
+      sent.push({ chatId, content: resolved, options });
       return { messageId: `om_sent_${sent.length}` };
     },
     async stream(chatId, input, options) {

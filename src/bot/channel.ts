@@ -31,6 +31,10 @@ import {
   type RunState,
   type WindowOptions,
 } from '../card/run-state';
+import {
+  startStreamingCardSession,
+  type StreamingCardSession,
+} from '../card/streaming-session';
 import { renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
@@ -863,15 +867,43 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         completedTools: 0,
         inFlightTools: 0,
       };
-      let producerStarted = false;
       let progressUpdateFailed = false;
       let fallbackSent = false;
       let cardAttached = false;
+      let activeSession: StreamingCardSession | undefined;
+      const sessionSendOpts = {
+        replyTo: sendOpts.replyTo,
+        ...(sendOpts.replyInThread ? { replyInThread: true as const } : {}),
+      };
       const renderProgressCard = (state: RunState, progress: RunCardProgress): object =>
         renderCard(filterForPrefs(state), { ...cardRenderOptions, progress });
       const cardUpdater = new ResilientCardUpdater({
-        sendSuccessor: (card) => channel.send(chatId, { card }, sendOpts),
-        updateMessage: (messageId, card) => channel.updateCard(messageId, card),
+        sendSuccessor: async (card) => {
+          const prev = activeSession;
+          if (prev) {
+            try {
+              await prev.close();
+            } catch {
+              /* best-effort finalize of the expired stream */
+            }
+            prev.dispose();
+          }
+          const next = await startStreamingCardSession(
+            channel,
+            chatId,
+            card,
+            sessionSendOpts,
+          );
+          activeSession = next;
+          return { messageId: next.messageId };
+        },
+        updateMessage: async (messageId, card) => {
+          if (activeSession?.messageId === messageId) {
+            await activeSession.update(card);
+            return;
+          }
+          await channel.updateCard(messageId, card);
+        },
         onRollover: (previousMessageId, nextMessageId) => {
           log.warn('stream', 'card-rollover', {
             previousMessageId: previousMessageId ?? null,
@@ -879,6 +911,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           });
         },
       });
+      const sendCardFallback = async (state: RunState): Promise<void> => {
+        if (controls.profileConfig.agentKind === 'codex') return;
+        if (renderText(filterForPrefs(state)).trim() === '') return;
+        await channel.send(
+          chatId,
+          { card: renderProgressCard(state, latestProgress) },
+          sendOpts,
+        );
+        fallbackSent = true;
+      };
+      // Drain agent events immediately so we don't drop output while the
+      // CardKit entity is being created. Flushes no-op until cardAttached.
       const renderDone = processAgentStream(
         handle,
         eventStream,
@@ -902,57 +946,60 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           },
         },
       );
-      const sendCardFallback = async (state: RunState): Promise<void> => {
-        if (controls.profileConfig.agentKind === 'codex') return;
-        if (renderText(filterForPrefs(state)).trim() === '') return;
-        await channel.send(
-          chatId,
-          { card: renderProgressCard(state, latestProgress) },
-          sendOpts,
-        );
-        fallbackSent = true;
-      };
-      const streamDone = channel.stream(
-        chatId,
-        {
-          card: {
-            initial: renderProgressCard(initialState, latestProgress),
-            producer: async (ctrl) => {
-              producerStarted = true;
-              cardAttached = true;
-              cardUpdater.attachPrimary(ctrl.messageId, (card) => ctrl.update(card));
-              await cardUpdater.update(renderProgressCard(latestState, latestProgress));
-              await renderDone;
-            },
-          },
-        },
-        sendOpts,
-      );
       try {
-        await awaitRenderAwareStream({
-          mode: replyMode,
-          streamDone,
-          renderDone,
-          producerStarted: () => producerStarted,
-          fallback: sendCardFallback,
+        try {
+          activeSession = await startStreamingCardSession(
+            channel,
+            chatId,
+            renderProgressCard(initialState, latestProgress),
+            sessionSendOpts,
+          );
+          cardAttached = true;
+          cardUpdater.attachPrimary(activeSession.messageId, (card) => {
+            if (!activeSession) throw new Error('streaming card session missing');
+            return activeSession.update(card);
+          });
+          await cardUpdater.update(renderProgressCard(latestState, latestProgress));
+        } catch (err) {
+          log.fail('stream', err, {
+            mode: replyMode,
+            step: cardAttached ? 'card-attach' : 'session-create',
+          });
+          progressUpdateFailed = true;
+        }
+
+        try {
+          await renderDone;
+        } catch (err) {
+          if (controls.profileConfig.agentKind !== 'codex') throw err;
+          log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
+        }
+        if ((!cardAttached || progressUpdateFailed) && !fallbackSent) {
+          await sendCardFallback(latestState);
+        }
+        const streamDone = Promise.resolve({
+          messageId: activeSession?.messageId,
         });
-      } catch (err) {
-        if (controls.profileConfig.agentKind !== 'codex') throw err;
-        log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
-      }
-      if (progressUpdateFailed && !fallbackSent) {
-        await sendCardFallback(latestState);
-      }
-      recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
-      if (controls.profileConfig.agentKind === 'codex') {
-        await sendReservedFinalReply({
-          channel,
-          chatId,
-          state: latestState,
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        recallIfEmptyStreamedReply(channel, streamDone, filterForPrefs(latestState), scope);
+        if (controls.profileConfig.agentKind === 'codex') {
+          await sendReservedFinalReply({
+            channel,
+            chatId,
+            state: latestState,
+            replyMode,
+            sendOpts,
+            cardRenderOptions,
+          });
+        }
+      } finally {
+        if (activeSession) {
+          try {
+            await activeSession.close();
+          } catch (err) {
+            log.fail('stream', err, { step: 'streaming-close' });
+          }
+          activeSession.dispose();
+        }
       }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;

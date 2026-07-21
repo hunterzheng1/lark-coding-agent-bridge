@@ -35,6 +35,7 @@ export interface FakeChannel {
         readonly card: {
           create(params: unknown): Promise<unknown>;
           update(params: unknown): Promise<unknown>;
+          settings(params: unknown): Promise<unknown>;
         };
       };
     };
@@ -101,6 +102,10 @@ export function createFakeChannel(): FakeChannel {
               requests.push({ method: 'cardkit.v1.card.update', params });
               return {};
             },
+            async settings(params: unknown): Promise<unknown> {
+              requests.push({ method: 'cardkit.v1.card.settings', params });
+              return {};
+            },
           },
         },
       },
@@ -127,6 +132,7 @@ export function createFakeChannel(): FakeChannel {
       return { cardId };
     },
     async updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void> {
+      cardById.set(cardId, cardJson);
       requests.push({ method: 'cardkit.v1.card.update', params: { cardId, cardJson, sequence } });
     },
     async send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }> {
