@@ -505,6 +505,11 @@ async function createHarness(options: {
       allowedChats: ['oc_topic_chat'],
       allowedUsers: ['ou_user'],
     },
+    preferences: {
+      // Assertions target channel.stream options; keep markdown after default
+      // messageReply flipped to card.
+      messageReply: 'markdown',
+    },
     ...(agentKind === 'codex' ? { codex: { binaryPath: '/usr/local/bin/codex' } } : {}),
   });
   const profileConfig = {

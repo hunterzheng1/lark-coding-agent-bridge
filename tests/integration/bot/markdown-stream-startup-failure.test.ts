@@ -184,6 +184,11 @@ async function createHarness(options: {
     access: {
       allowedUsers: ['ou_user'],
     },
+    preferences: {
+      // Suite asserts markdown stream / reaction behavior; keep explicit after
+      // default messageReply flipped to card.
+      messageReply: 'markdown',
+    },
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
