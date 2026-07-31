@@ -189,6 +189,8 @@ async function* createEventStream(
   }
 
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  let sessionAccepted = false;
+  let agentActivityStarted = false;
   let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
   const closeInheritedStdout = (): void => {
     // On Windows the spawned process can be a .cmd shim. Killing that shim may
@@ -214,7 +216,29 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      for (const event of translateEvent(parsed)) {
+        if (event.type === 'system') {
+          if (!event.sessionId) {
+            yield event;
+            continue;
+          }
+          if (sessionAccepted || agentActivityStarted) {
+            log.warn('agent', 'codebuddy-session-ignored', {
+              reason: agentActivityStarted
+                ? 'agent-activity-started'
+                : 'session-already-accepted',
+              hasAcceptedSession: sessionAccepted,
+              eventType: event.type,
+            });
+            continue;
+          }
+          sessionAccepted = true;
+          yield event;
+          continue;
+        }
+        agentActivityStarted = true;
+        yield event;
+      }
     }
   } finally {
     if (exitDrainTimer) clearTimeout(exitDrainTimer);
