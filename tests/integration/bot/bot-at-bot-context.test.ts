@@ -71,6 +71,18 @@ afterEach(async () => {
 });
 
 describe('bot identity injection into the agent adapter', () => {
+  it('passes the relaxed ping timeout to the channel', async () => {
+    const h = await createHarness();
+
+    await startTestBridge(h);
+
+    const calls = sdkMock.createLarkChannel.mock.calls as unknown as Array<[unknown]>;
+    const options = calls[0]?.[0] as {
+      wsConfig?: { pingTimeout?: number };
+    } | undefined;
+    expect(options?.wsConfig?.pingTimeout).toBe(10);
+  });
+
   it('passes channel.botIdentity to the adapter after connect', async () => {
     const h = await createHarness();
 
