@@ -8,6 +8,7 @@ import {
   daemonStdoutPath,
   windowsTaskName,
   windowsLauncherCmdPath,
+  windowsLauncherVbsPath,
 } from './paths';
 import { paths } from '../config/paths';
 
@@ -24,6 +25,12 @@ export interface LauncherInputs {
   channelHome: string;
 }
 
+/** Delay after an ONLOGON trigger, giving the user's network stack time to settle. */
+export const WINDOWS_LOGON_DELAY = '0001:00';
+
+/** Backoff between bridge restarts after a transient startup failure. */
+export const WINDOWS_LAUNCHER_RETRY_SECONDS = 15;
+
 /**
  * Generate the .cmd wrapper script that the scheduled task actually invokes.
  *
@@ -34,19 +41,55 @@ export interface LauncherInputs {
  *
  * `@echo off` keeps the script's own commands out of the daemon log.
  * `>>` / `2>>` append (not truncate) so log history is preserved across
- * daemon restarts.
+ * daemon restarts. A service can start while DNS/proxy initialization is
+ * still in progress; a non-zero bridge exit therefore stays inside this
+ * launcher and retries instead of making Task Scheduler believe the task
+ * completed successfully.
  */
 export function buildLauncherCmd(inputs: LauncherInputs): string {
   return [
     '@echo off',
+    'setlocal',
     `set "LARK_CHANNEL_HOME=${inputs.channelHome}"`,
     `set "PATH=${inputs.envPath}"`,
+    ':bridge_retry',
     `"${inputs.nodePath}" "${inputs.bridgeEntryPath}" run --profile "${inputs.profile}" >> "${daemonStdoutPath(inputs.profile)}" 2>> "${daemonStderrPath(inputs.profile)}"`,
+    'set "EXIT_CODE=%ERRORLEVEL%"',
+    'if "%EXIT_CODE%"=="0" goto bridge_done',
+    `>> "${daemonStderrPath(inputs.profile)}" echo [launcher] bridge exited with code %EXIT_CODE%; retrying in ${WINDOWS_LAUNCHER_RETRY_SECONDS} seconds.`,
+    `timeout /t ${WINDOWS_LAUNCHER_RETRY_SECONDS} /nobreak >nul`,
+    'goto bridge_retry',
+    ':bridge_done',
+    'endlocal & exit /b 0',
     '',
   ].join('\r\n');
 }
 
-async function writeLauncherCmd(profile: string): Promise<void> {
+export interface LauncherVbsInputs {
+  /** Absolute path to the .cmd launcher generated alongside this wrapper. */
+  launcherCmdPath: string;
+}
+
+/**
+ * Generate the Windows Script Host wrapper used by Task Scheduler.
+ *
+ * `wscript.exe` is a GUI-subsystem host, so invoking it as the task action
+ * avoids the visible console that appears when a task starts a `.cmd` file
+ * directly. `Run(..., 0, True)` keeps the child hidden and waits for the
+ * retrying launcher to finish.
+ */
+export function buildLauncherVbs(inputs: LauncherVbsInputs): string {
+  const command = `cmd.exe /d /c ""${inputs.launcherCmdPath}""`;
+  const escapedCommand = command.replace(/"/g, '""');
+  return [
+    "' lark-channel-bridge hidden launcher (wscript -> cmd, no console window)",
+    'Set WshShell = CreateObject("WScript.Shell")',
+    `WshShell.Run "${escapedCommand}", 0, True`,
+    '',
+  ].join('\r\n');
+}
+
+async function writeLauncherScripts(profile: string): Promise<void> {
   const bridgeEntryPath = process.argv[1];
   if (!bridgeEntryPath) {
     throw new Error('cannot determine bridge entry path (process.argv[1] is empty)');
@@ -62,12 +105,40 @@ async function writeLauncherCmd(profile: string): Promise<void> {
   await mkdir(dirname(cmdPath), { recursive: true });
   await mkdir(daemonLogDir(profile), { recursive: true });
   await writeFile(cmdPath, content, 'utf8');
+  await writeFile(
+    windowsLauncherVbsPath(profile),
+    buildLauncherVbs({ launcherCmdPath: cmdPath }),
+    'utf8',
+  );
 }
 
 interface SchtasksResult {
   ok: boolean;
   stderr: string;
   stdout: string;
+}
+
+/** Build the complete task registration command for one profile. */
+export function buildSchtasksCreateArgs(profile: string): string[] {
+  return [
+    '/Create',
+    '/F',
+    '/SC',
+    'ONLOGON',
+    '/DELAY',
+    WINDOWS_LOGON_DELAY,
+    '/RL',
+    'LIMITED',
+    '/TN',
+    windowsTaskName(profile),
+    '/TR',
+    `"wscript.exe" "${windowsLauncherVbsPath(profile)}"`,
+  ];
+}
+
+/** Build the explicit enable operation used after overwriting a task. */
+export function buildSchtasksEnableArgs(profile: string): string[] {
+  return ['/Change', '/TN', windowsTaskName(profile), '/Enable'];
 }
 
 function runSchtasks(args: string[]): SchtasksResult {
@@ -84,27 +155,25 @@ function runSchtasks(args: string[]): SchtasksResult {
  * `/RL LIMITED` runs as the current user without admin elevation.
  * `/F` overwrites if the task already exists.
  *
- * The /TR value is the .cmd wrapper path. Schtasks treats /TR as a command
- * line, so wrapping in quotes keeps spaces in the path intact.
+ * The /TR value is the hidden WScript wrapper. Schtasks treats /TR as a
+ * command line, so wrapping both executable and script paths in quotes keeps
+ * spaces in the paths intact while avoiding a visible console window.
  */
 export async function installTask(profile: string): Promise<SchtasksResult> {
-  await writeLauncherCmd(profile);
-  return runSchtasks([
-    '/Create',
-    '/F',
-    '/SC',
-    'ONLOGON',
-    '/RL',
-    'LIMITED',
-    '/TN',
-    windowsTaskName(profile),
-    '/TR',
-    `"${windowsLauncherCmdPath(profile)}"`,
-  ]);
+  await writeLauncherScripts(profile);
+  const created = runSchtasks(buildSchtasksCreateArgs(profile));
+  if (!created.ok) return created;
+
+  // `/Create /F` preserves the disabled state of an existing task on some
+  // Windows builds. Explicitly enable after replacing legacy registrations;
+  // otherwise `start` appears successful while the next logon still skips it.
+  return runSchtasks(buildSchtasksEnableArgs(profile));
 }
 
-/** Start the task now (regardless of trigger). */
+/** Start the task now (regardless of trigger), ensuring autostart is enabled. */
 export function runTask(profile: string): SchtasksResult {
+  const enabled = runSchtasks(buildSchtasksEnableArgs(profile));
+  if (!enabled.ok) return enabled;
   return runSchtasks(['/Run', '/TN', windowsTaskName(profile)]);
 }
 
@@ -118,10 +187,9 @@ export function disableTask(profile: string): SchtasksResult {
   return runSchtasks(['/Change', '/TN', windowsTaskName(profile), '/Disable']);
 }
 
-/** Re-enable autostart. Called from installTask is unnecessary — /Create /F
- * resets the enabled flag. Only needed if you Disabled and want it back. */
+/** Re-enable autostart for an existing task. */
 export function enableTask(profile: string): SchtasksResult {
-  return runSchtasks(['/Change', '/TN', windowsTaskName(profile), '/Enable']);
+  return runSchtasks(buildSchtasksEnableArgs(profile));
 }
 
 /** End + disable. The cross-platform "stop = stay stopped" semantic. */
@@ -182,6 +250,9 @@ export async function deleteTask(profile: string): Promise<SchtasksResult> {
   // Remove the launcher script too; best-effort.
   if (existsSync(windowsLauncherCmdPath(profile))) {
     await rm(windowsLauncherCmdPath(profile), { force: true });
+  }
+  if (existsSync(windowsLauncherVbsPath(profile))) {
+    await rm(windowsLauncherVbsPath(profile), { force: true });
   }
   return r;
 }

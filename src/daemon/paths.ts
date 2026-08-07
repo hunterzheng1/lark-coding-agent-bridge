@@ -79,6 +79,17 @@ export function windowsLauncherCmdPath(profile: string = paths.profile): string 
   return join(paths.appDir, 'daemon', serviceProfileId(profile), 'launcher.cmd');
 }
 
+/**
+ * Hidden Windows Script Host wrapper for the launcher .cmd.
+ *
+ * Task Scheduler runs `wscript.exe` instead of invoking the .cmd directly so
+ * the bridge stays attached to a background process without opening a console
+ * window. The VBS wrapper then runs the existing .cmd and waits for it.
+ */
+export function windowsLauncherVbsPath(profile: string = paths.profile): string {
+  return join(paths.appDir, 'daemon', serviceProfileId(profile), 'launcher.vbs');
+}
+
 // === Daemon log paths (platform-agnostic) ===
 
 /**
