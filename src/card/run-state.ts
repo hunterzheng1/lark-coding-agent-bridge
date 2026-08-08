@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../agent/types';
+import { summarizeToolCalls } from './tool-summary';
 
 export type ToolStatus = 'running' | 'done' | 'error';
 
@@ -203,10 +204,10 @@ export function windowState(state: RunState, opts: WindowOptions): RunState {
       const collapsedTools = toolIndices
         .slice(0, collapseCount)
         .map((i) => (blocks[i] as { kind: 'tool'; tool: ToolEntry }).tool);
-      const headerList = collapsedTools.map((t) => `- ${t.name}`).join('\n');
+      const summary = summarizeToolCalls(collapsedTools, state.terminal !== 'running');
       const summaryBlock: Block = {
         kind: 'text',
-        content: `☕ ${collapseCount} earlier tool calls\n${headerList}`,
+        content: `${summary.title}\n${summary.body}`,
         streaming: false,
       };
       const rebuilt: Block[] = [];

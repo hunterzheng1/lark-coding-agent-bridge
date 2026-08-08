@@ -36,7 +36,7 @@ describe('windowState', () => {
     expect(out.truncated).toBe(false);
   });
 
-  it('U3: tools > maxTools collapse oldest into summary, keep latest', () => {
+  it('U3: tools > maxTools collapse oldest into bounded summary, keep latest', () => {
     const s = stateWith([
       toolBlock('1', 'Read'),
       toolBlock('2', 'Grep'),
@@ -51,11 +51,26 @@ describe('windowState', () => {
     }[];
     expect(toolBlocks.length).toBe(3);
     expect(toolBlocks.map((b) => b.tool.id)).toEqual(['3', '4', '5']);
-    const summary = out.blocks.find(
-      (b) => b.kind === 'text' && b.content.includes('earlier tool calls'),
-    ) as { kind: 'text'; content: string } | undefined;
+    const summary = out.blocks.find((b) => b.kind === 'text') as
+      | { kind: 'text'; content: string }
+      | undefined;
     expect(summary).toBeTruthy();
-    expect(summary!.content).toContain('2');
+    expect(summary!.content).toContain('2 个工具调用');
+  });
+
+  it('U3b: 57 tools do not expand the 49 collapsed tool names line by line', () => {
+    const tools = Array.from({ length: 57 }, (_, index) =>
+      toolBlock(String(index + 1), `OldTool${String(index + 1).padStart(2, '0')}`),
+    );
+    const out = windowState(stateWith(tools), { maxTools: 8, maxTextChars: 10_000 });
+    const summary = out.blocks.find((b) => b.kind === 'text') as
+      | { kind: 'text'; content: string }
+      | undefined;
+
+    expect(summary).toBeTruthy();
+    expect(summary!.content).toContain('49 个工具调用');
+    expect(summary!.content.match(/OldTool/g)?.length ?? 0).toBeLessThanOrEqual(7);
+    expect(summary!.content).not.toContain('\n- ');
   });
 
   it('U4: text under maxTextChars unchanged, truncated false', () => {
