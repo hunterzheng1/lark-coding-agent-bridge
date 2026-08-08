@@ -1,8 +1,8 @@
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import { planToolDisplay, summarizeToolCalls, TOOL_SUMMARY_THRESHOLD } from './tool-summary';
 
 const REASONING_MAX = 1500;
-const COLLAPSE_TOOL_THRESHOLD = 3;
 
 interface ToolGroup {
   kind: 'tools';
@@ -29,6 +29,11 @@ export interface RunCardProgress {
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
+  const allTools = state.blocks
+    .filter((block): block is Extract<Block, { kind: 'tool' }> => block.kind === 'tool')
+    .map((block) => block.tool);
+  const summarizeAllTools = allTools.length >= TOOL_SUMMARY_THRESHOLD;
+  let renderedToolSummary = false;
 
   if (state.terminal === 'running' && options.progress) {
     elements.push(progressStatus(options.progress));
@@ -42,6 +47,11 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     if (group.kind === 'text') {
       if (group.content.trim()) {
         elements.push(markdown(group.content));
+      }
+    } else if (summarizeAllTools) {
+      if (!renderedToolSummary) {
+        elements.push(...renderToolGroup(allTools, state.terminal !== 'running'));
+        renderedToolSummary = true;
       }
     } else {
       elements.push(...renderToolGroup(group.tools, state.terminal !== 'running'));
@@ -92,18 +102,17 @@ function* groupBlocks(blocks: Block[]): Generator<Group> {
 
 function renderToolGroup(tools: ToolEntry[], finalized: boolean): object[] {
   if (tools.length === 0) return [];
-  if (tools.length < COLLAPSE_TOOL_THRESHOLD) {
+  if (tools.length < TOOL_SUMMARY_THRESHOLD) {
     return tools.map((t) => toolPanel(t, false));
   }
   if (finalized) {
     return [collapsedToolSummary(tools, true)];
   }
-  // Running: collapse prior tools, keep latest visible.
-  const prior = tools.slice(0, -1);
-  const latest = tools[tools.length - 1];
+  // Running: collapse completed/older tools, keep the actual latest live tool visible.
+  const plan = planToolDisplay(tools, false);
   const out: object[] = [];
-  if (prior.length > 0) out.push(collapsedToolSummary(prior, false));
-  if (latest) out.push(toolPanel(latest, true));
+  if (plan.summaryTools.length > 0) out.push(collapsedToolSummary(plan.summaryTools, false));
+  if (plan.liveTool) out.push(toolPanel(plan.liveTool, true));
   return out;
 }
 
@@ -127,8 +136,8 @@ function toolPanel(tool: ToolEntry, expanded: boolean): object {
 }
 
 /**
- * Render N tool calls as a single collapsed panel. **Body content is dropped**
- * — only the per-tool header line (icon + name + short summary) is kept.
+ * Render N tool calls as a single collapsed, bounded summary. Calls are
+ * aggregated by type and status; only recent and failed headers are retained.
  *
  * Why no bodies: with full input/output panels nested, the serialized JSON
  * can easily exceed Feishu's per-element size limit (~30KB), causing 400
@@ -139,17 +148,15 @@ function toolPanel(tool: ToolEntry, expanded: boolean): object {
  * `toolPanel(latest, true)` so live observation isn't sacrificed.
  */
 function collapsedToolSummary(tools: ToolEntry[], finalized: boolean): object {
-  const suffix = finalized ? '（已结束）' : '';
-  const title = `☕ **${tools.length} 个工具调用${suffix}**`;
-  const headerList = tools.map((t) => `- ${toolHeaderText(t)}`).join('\n');
+  const summary = summarizeToolCalls(tools, finalized);
   return {
     tag: 'collapsible_panel',
     expanded: false,
-    header: panelHeader(title),
+    header: panelHeader(summary.title),
     border: { color: 'blue', corner_radius: '5px' },
     vertical_spacing: '8px',
     padding: '8px 8px 8px 8px',
-    elements: [{ tag: 'markdown', content: headerList, text_size: 'notation' }],
+    elements: [{ tag: 'markdown', content: summary.body, text_size: 'notation' }],
   };
 }
 

@@ -11,8 +11,8 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
         },
         "elements": [
           {
-            "content": "- ✅ **Bash** — pwd
-- ✅ **Read** — /repo/a.ts",
+            "content": "**类型** Bash ×1 · Read ×1
+**最近** ✅ **Read** — /repo/a.ts",
             "tag": "markdown",
             "text_size": "notation",
           },
@@ -27,7 +27,7 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "☕ **2 个工具调用**",
+            "content": "☕ **2 个工具调用 · 2 成功**",
             "tag": "markdown",
           },
           "vertical_align": "center",
@@ -113,9 +113,8 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
         },
         "elements": [
           {
-            "content": "- ✅ **Bash** — pwd
-- ✅ **Read** — /repo/a.ts
-- ✅ **Edit** — /repo/a.ts",
+            "content": "**类型** Bash ×1 · Edit ×1 · Read ×1
+**最近** ✅ **Read** — /repo/a.ts · ✅ **Edit** — /repo/a.ts",
             "tag": "markdown",
             "text_size": "notation",
           },
@@ -130,7 +129,7 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "☕ **3 个工具调用（已结束）**",
+            "content": "☕ **3 个工具调用（已结束） · 3 成功**",
             "tag": "markdown",
           },
           "vertical_align": "center",
