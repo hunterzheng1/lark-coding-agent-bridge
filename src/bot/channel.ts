@@ -1175,7 +1175,7 @@ async function sendReservedFinalReply(input: {
  * on every state transition. Used by both card and markdown reply modes —
  * the only difference between the two is what `flush` does with the state.
  */
-const WINDOW_OPTS: WindowOptions = { maxTools: 8, maxTextChars: 4000 };
+const WINDOW_OPTS: WindowOptions = { maxTextChars: 4000 };
 
 const HEARTBEAT_INTERVAL_MS = 3 * 60_000;
 

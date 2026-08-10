@@ -13,30 +13,6 @@ export interface ToolCallSummary {
   body: string;
 }
 
-export interface ToolDisplayPlan {
-  summaryTools: ToolEntry[];
-  liveTool?: ToolEntry;
-}
-
-/** Select the actual latest running tool instead of assuming array order. */
-export function planToolDisplay(tools: ToolEntry[], finalized: boolean): ToolDisplayPlan {
-  if (finalized) return { summaryTools: tools };
-
-  let liveIndex = -1;
-  for (let index = tools.length - 1; index >= 0; index -= 1) {
-    if (tools[index]?.status === 'running') {
-      liveIndex = index;
-      break;
-    }
-  }
-  if (liveIndex < 0) return { summaryTools: tools };
-
-  return {
-    summaryTools: tools.filter((_, index) => index !== liveIndex),
-    liveTool: tools[liveIndex],
-  };
-}
-
 /**
  * Build a bounded summary for a tool-call collection. The renderer keeps the
  * complete ToolEntry list in RunState for diagnostics, but the user-facing
@@ -59,23 +35,30 @@ export function summarizeToolCalls(tools: ToolEntry[], finalized: boolean): Tool
   const suffix = finalized ? '（已结束）' : '';
   const titleParts = [`${tools.length} 个工具调用${suffix}`, ...statusParts];
   const lines = [formatTypeCounts(typeCounts)];
-  // Once a collection crosses the summary threshold, never reveal every
-  // header through a combination of recent and failure sections.
-  const visibleHeaderBudget = Math.min(
-    MAX_VISIBLE_TOOL_HEADERS,
-    Math.max(0, tools.length - 1),
-  );
+  // Small collections can show every header inside the one container. Once a
+  // collection crosses the threshold, keep at least one header hidden so the
+  // summary never grows linearly with the number of calls.
+  const visibleHeaderBudget = tools.length < TOOL_SUMMARY_THRESHOLD
+    ? tools.length
+    : Math.min(MAX_VISIBLE_TOOL_HEADERS, Math.max(0, tools.length - 1));
+  const running = tools.filter((tool) => tool.status === 'running');
+  const visibleRunning = running.slice(-Math.min(1, visibleHeaderBudget));
+  let remainingHeaderBudget = visibleHeaderBudget - visibleRunning.length;
   const failed = tools.filter((tool) => tool.status === 'error');
-  const visibleFailed = failed.slice(-Math.min(MAX_FAILED_TOOLS, visibleHeaderBudget));
+  const visibleFailed = failed.slice(-Math.min(MAX_FAILED_TOOLS, remainingHeaderBudget));
+  remainingHeaderBudget -= visibleFailed.length;
   const recentBudget = Math.min(
     MAX_RECENT_TOOLS,
-    visibleHeaderBudget - visibleFailed.length,
+    remainingHeaderBudget,
   );
   const recent = recentBudget > 0
     ? tools
-        .filter((tool) => tool.status !== 'error')
+        .filter((tool) => tool.status === 'done')
         .slice(-recentBudget)
     : [];
+  if (visibleRunning.length > 0) {
+    lines.push(`**当前** ${visibleRunning.map(toolHeaderText).join(' · ')}`);
+  }
   if (recent.length > 0) {
     lines.push(`**最近** ${recent.map(toolHeaderText).join(' · ')}`);
   }

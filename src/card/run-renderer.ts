@@ -1,18 +1,7 @@
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
-import { toolBodyMd, toolHeaderText } from './tool-render';
-import { planToolDisplay, summarizeToolCalls, TOOL_SUMMARY_THRESHOLD } from './tool-summary';
+import { summarizeToolCalls } from './tool-summary';
 
 const REASONING_MAX = 1500;
-
-interface ToolGroup {
-  kind: 'tools';
-  tools: ToolEntry[];
-}
-interface TextGroup {
-  kind: 'text';
-  content: string;
-}
-type Group = ToolGroup | TextGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
@@ -32,7 +21,6 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   const allTools = state.blocks
     .filter((block): block is Extract<Block, { kind: 'tool' }> => block.kind === 'tool')
     .map((block) => block.tool);
-  const summarizeAllTools = allTools.length >= TOOL_SUMMARY_THRESHOLD;
   let renderedToolSummary = false;
 
   if (state.terminal === 'running' && options.progress) {
@@ -43,18 +31,14 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));
   }
 
-  for (const group of groupBlocks(state.blocks)) {
-    if (group.kind === 'text') {
-      if (group.content.trim()) {
-        elements.push(markdown(group.content));
+  for (const block of state.blocks) {
+    if (block.kind === 'text') {
+      if (block.content.trim()) {
+        elements.push(markdown(block.content));
       }
-    } else if (summarizeAllTools) {
-      if (!renderedToolSummary) {
-        elements.push(...renderToolGroup(allTools, state.terminal !== 'running'));
-        renderedToolSummary = true;
-      }
-    } else {
-      elements.push(...renderToolGroup(group.tools, state.terminal !== 'running'));
+    } else if (!renderedToolSummary) {
+      elements.push(collapsedToolSummary(allTools, state.terminal !== 'running'));
+      renderedToolSummary = true;
     }
   }
 
@@ -84,38 +68,6 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   };
 }
 
-function* groupBlocks(blocks: Block[]): Generator<Group> {
-  let toolBuf: ToolEntry[] = [];
-  for (const b of blocks) {
-    if (b.kind === 'tool') {
-      toolBuf.push(b.tool);
-    } else {
-      if (toolBuf.length > 0) {
-        yield { kind: 'tools', tools: toolBuf };
-        toolBuf = [];
-      }
-      yield { kind: 'text', content: b.content };
-    }
-  }
-  if (toolBuf.length > 0) yield { kind: 'tools', tools: toolBuf };
-}
-
-function renderToolGroup(tools: ToolEntry[], finalized: boolean): object[] {
-  if (tools.length === 0) return [];
-  if (tools.length < TOOL_SUMMARY_THRESHOLD) {
-    return tools.map((t) => toolPanel(t, false));
-  }
-  if (finalized) {
-    return [collapsedToolSummary(tools, true)];
-  }
-  // Running: collapse completed/older tools, keep the actual latest live tool visible.
-  const plan = planToolDisplay(tools, false);
-  const out: object[] = [];
-  if (plan.summaryTools.length > 0) out.push(collapsedToolSummary(plan.summaryTools, false));
-  if (plan.liveTool) out.push(toolPanel(plan.liveTool, true));
-  return out;
-}
-
 function reasoningPanel(content: string, active: boolean): object {
   const title = active ? '🧠 **思考中**' : '🧠 **思考完成，点击查看**';
   return collapsiblePanel({
@@ -126,26 +78,18 @@ function reasoningPanel(content: string, active: boolean): object {
   });
 }
 
-function toolPanel(tool: ToolEntry, expanded: boolean): object {
-  return collapsiblePanel({
-    title: toolHeaderText(tool),
-    expanded,
-    border: tool.status === 'error' ? 'red' : 'grey',
-    body: toolBodyMd(tool) || '_无输出_',
-  });
-}
-
 /**
- * Render N tool calls as a single collapsed, bounded summary. Calls are
- * aggregated by type and status; only recent and failed headers are retained.
+ * Render every tool call in the run as one collapsed, bounded summary. Calls
+ * are aggregated by type and status; only current, recent, and failed headers
+ * are retained inside this same panel.
  *
  * Why no bodies: with full input/output panels nested, the serialized JSON
  * can easily exceed Feishu's per-element size limit (~30KB), causing 400
  * errors that abort the entire card stream. Tool details are still in the
  * file log; users who really need them can `/doctor` to inspect.
  *
- * The latest-running tool, when applicable, is rendered separately via
- * `toolPanel(latest, true)` so live observation isn't sacrificed.
+ * The latest-running tool stays visible in the summary body instead of being
+ * split into a second expanded panel.
  */
 function collapsedToolSummary(tools: ToolEntry[], finalized: boolean): object {
   const summary = summarizeToolCalls(tools, finalized);

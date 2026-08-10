@@ -11,7 +11,8 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
         },
         "elements": [
           {
-            "content": "**类型** Bash ×1 · Read ×1
+            "content": "**类型** Bash ×1 · Edit ×1 · Read ×1
+**当前** ⏳ **Edit** — /repo/a.ts
 **最近** ✅ **Read** — /repo/a.ts",
             "tag": "markdown",
             "text_size": "notation",
@@ -27,40 +28,7 @@ exports[`run card renderer snapshots > collapses consecutive tools while preserv
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "☕ **2 个工具调用 · 2 成功**",
-            "tag": "markdown",
-          },
-          "vertical_align": "center",
-        },
-        "padding": "8px 8px 8px 8px",
-        "tag": "collapsible_panel",
-        "vertical_spacing": "8px",
-      },
-      {
-        "border": {
-          "color": "grey",
-          "corner_radius": "5px",
-        },
-        "elements": [
-          {
-            "content": "**File** \`/repo/a.ts\`
-
-_运行中…_",
-            "tag": "markdown",
-            "text_size": "notation",
-          },
-        ],
-        "expanded": true,
-        "header": {
-          "icon": {
-            "size": "16px 16px",
-            "tag": "standard_icon",
-            "token": "down-small-ccm_outlined",
-          },
-          "icon_expanded_angle": -180,
-          "icon_position": "follow_text",
-          "title": {
-            "content": "⏳ **Edit** — /repo/a.ts",
+            "content": "☕ **3 个工具调用 · 2 成功 · 1 运行中**",
             "tag": "markdown",
           },
           "vertical_align": "center",
@@ -401,7 +369,9 @@ exports[`run card renderer snapshots > renders initial running state 1`] = `
 exports[`run card renderer snapshots > renders markdown text mode without card-only controls 1`] = `
 "Answer
 
-> ✅ **Bash** — pwd
+> ☕ **1 个工具调用 · 1 成功**
+> **类型** Bash ×1
+> **最近** ✅ **Bash** — pwd
 
 Done
 
@@ -411,7 +381,9 @@ _✍️ 正在输出…_"
 exports[`run card renderer snapshots > renders markdown text mode without card-only controls 2`] = `
 "Answer
 
-> ✅ **Bash** — pwd
+> ☕ **1 个工具调用（已结束） · 1 成功**
+> **类型** Bash ×1
+> **最近** ✅ **Bash** — pwd
 
 Done
 
@@ -421,7 +393,9 @@ _⏹ 已被中断_"
 exports[`run card renderer snapshots > renders markdown text mode without card-only controls 3`] = `
 "Answer
 
-> ✅ **Bash** — pwd
+> ☕ **1 个工具调用（已结束） · 1 成功**
+> **类型** Bash ×1
+> **最近** ✅ **Bash** — pwd
 
 Done
 
@@ -436,17 +410,13 @@ exports[`run card renderer snapshots > renders tool running, done, and error sta
     "elements": [
       {
         "border": {
-          "color": "grey",
+          "color": "blue",
           "corner_radius": "5px",
         },
         "elements": [
           {
-            "content": "**Command**
-\`\`\`bash
-pwd
-\`\`\`
-
-_运行中…_",
+            "content": "**类型** Bash ×1
+**当前** ⏳ **Bash** — pwd",
             "tag": "markdown",
             "text_size": "notation",
           },
@@ -461,7 +431,7 @@ _运行中…_",
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "⏳ **Bash** — pwd",
+            "content": "☕ **1 个工具调用 · 1 运行中**",
             "tag": "markdown",
           },
           "vertical_align": "center",
@@ -509,20 +479,13 @@ exports[`run card renderer snapshots > renders tool running, done, and error sta
     "elements": [
       {
         "border": {
-          "color": "grey",
+          "color": "blue",
           "corner_radius": "5px",
         },
         "elements": [
           {
-            "content": "**Command**
-\`\`\`bash
-pwd
-\`\`\`
-
-**Output**
-\`\`\`
-/repo
-\`\`\`",
+            "content": "**类型** Bash ×1
+**最近** ✅ **Bash** — pwd",
             "tag": "markdown",
             "text_size": "notation",
           },
@@ -537,7 +500,7 @@ pwd
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "✅ **Bash** — pwd",
+            "content": "☕ **1 个工具调用（已结束） · 1 成功**",
             "tag": "markdown",
           },
           "vertical_align": "center",
@@ -564,17 +527,14 @@ exports[`run card renderer snapshots > renders tool running, done, and error sta
     "elements": [
       {
         "border": {
-          "color": "red",
+          "color": "blue",
           "corner_radius": "5px",
         },
         "elements": [
           {
-            "content": "**File** \`/missing.ts\`
-
-**Error**
-\`\`\`
-ENOENT
-\`\`\`",
+            "content": "**类型** Read ×1
+**失败详情**
+- ❌ **Read** — /missing.ts",
             "tag": "markdown",
             "text_size": "notation",
           },
@@ -589,7 +549,7 @@ ENOENT
           "icon_expanded_angle": -180,
           "icon_position": "follow_text",
           "title": {
-            "content": "❌ **Read** — /missing.ts",
+            "content": "☕ **1 个工具调用（已结束） · 1 失败**",
             "tag": "markdown",
           },
           "vertical_align": "center",

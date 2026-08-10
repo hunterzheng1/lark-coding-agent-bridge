@@ -5,6 +5,7 @@ import {
   markIdleTimeout,
   markInterrupted,
   reduce,
+  windowState,
   type RunState,
 } from '../../../src/card/run-state.js';
 import { renderText } from '../../../src/card/text-renderer.js';
@@ -112,26 +113,46 @@ describe('run card renderer snapshots', () => {
       { type: 'tool_use', id: 'tool-done-2', name: 'Edit', input: { file_path: '/repo/b.ts' } },
       { type: 'tool_result', id: 'tool-done-2', output: 'ok', isError: false },
     ]);
-    const card = renderCard(state) as {
-      body: {
-        elements: Array<{
-          tag?: string;
-          expanded?: boolean;
-          header?: { title?: { content?: string } };
-        }>;
-      };
-    };
-    const expandedPanels = card.body.elements.filter(
-      (element) => element.tag === 'collapsible_panel' && element.expanded,
-    );
-    const runningTextLines = renderText(state)
-      .split('\n')
-      .filter((line) => line.startsWith('> ⏳'));
+    const card = JSON.stringify(renderCard(state));
+    const text = renderText(state);
 
-    expect(expandedPanels).toHaveLength(1);
-    expect(expandedPanels[0]?.header?.title?.content).toContain('Bash');
-    expect(runningTextLines).toEqual(['> ⏳ **Bash** — long-running']);
+    expect(card.match(/3 个工具调用/g)).toHaveLength(1);
+    expect(card).toContain('1 运行中');
+    expect(card).toContain('long-running');
+    expect(card).not.toContain('"expanded":true');
+    expect(text.match(/3 个工具调用/g)).toHaveLength(1);
+    expect(text).toContain('1 运行中');
+    expect(text).toContain('long-running');
+    expect(text.split('\n').some((line) => line.startsWith('> ⏳'))).toBe(false);
   });
+
+  it.each([1, 2, 3, 8, 9, 11, 89, 257])(
+    'renders %i tool calls in exactly one bounded container after windowing',
+    (toolCount) => {
+      const state = windowState(stateFrom(runningToolEvents(toolCount)), {
+        maxTextChars: 10_000,
+      });
+      const renderedCard = renderCard(state) as {
+        body: { elements: Array<{ tag?: string; expanded?: boolean }> };
+      };
+      const toolPanels = renderedCard.body.elements.filter(
+        (element) => element.tag === 'collapsible_panel',
+      );
+      const card = JSON.stringify(renderedCard);
+      const text = renderText(state);
+
+      expect(toolPanels).toHaveLength(1);
+      expect(card.match(new RegExp(`${toolCount} 个工具调用`, 'g'))).toHaveLength(1);
+      expect(card).toContain('1 运行中');
+      expect(card).not.toContain('"expanded":true');
+      expect(card.length).toBeLessThan(5_000);
+
+      expect(text.match(new RegExp(`${toolCount} 个工具调用`, 'g'))).toHaveLength(1);
+      expect(text).toContain('1 运行中');
+      expect(text.split('\n').some((line) => line.startsWith('> ⏳'))).toBe(false);
+      expect(text.length).toBeLessThan(2_500);
+    },
+  );
 
   it('never exposes every header at the three-call summary threshold', () => {
     const state = stateFrom([
@@ -266,6 +287,30 @@ function interleavedToolEvents(): AgentEvent[] {
     );
   }
   events.push({ type: 'done', terminationReason: 'normal' });
+  return events;
+}
+
+function runningToolEvents(toolCount: number): AgentEvent[] {
+  const events: AgentEvent[] = [];
+  for (let index = 0; index < toolCount; index += 1) {
+    events.push({
+      type: 'tool_use',
+      id: `tool-${index}`,
+      name: index % 2 === 0 ? 'Bash' : 'Read',
+      input: index % 2 === 0
+        ? { command: `command-${index}` }
+        : { file_path: `/repo/file-${index}.ts` },
+    });
+    if (index < toolCount - 1) {
+      events.push({
+        type: 'tool_result',
+        id: `tool-${index}`,
+        output: 'ok',
+        isError: false,
+      });
+    }
+    if (index === 2) events.push({ type: 'text', delta: 'interleaved progress' });
+  }
   return events;
 }
 

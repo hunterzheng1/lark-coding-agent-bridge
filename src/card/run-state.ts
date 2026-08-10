@@ -1,5 +1,4 @@
 import type { AgentEvent } from '../agent/types';
-import { summarizeToolCalls } from './tool-summary';
 
 export type ToolStatus = 'running' | 'done' | 'error';
 
@@ -177,68 +176,33 @@ export function finalizeIfRunning(state: RunState): RunState {
 }
 
 export interface WindowOptions {
-  maxTools: number;
   maxTextChars: number;
 }
 
 /**
- * Bound a RunState's blocks for card rendering: collapse old tool calls into a
- * single summary block and trim accumulated text to the most recent window.
+ * Bound a RunState's text for card rendering while preserving every tool as a
+ * structured block. The renderer needs the full structured set to aggregate
+ * all tool calls into exactly one bounded container.
  * Sets `truncated` when any text was dropped so the caller can resend the full
  * text as a standalone message (C2 fallback). Pure function; input untouched.
  */
 export function windowState(state: RunState, opts: WindowOptions): RunState {
-  const { maxTools, maxTextChars } = opts;
+  const { maxTextChars } = opts;
   const blocks = state.blocks;
 
-  // Step 1: collapse old tool blocks into one summary when over maxTools.
-  let blocksAfterTools: Block[] = blocks;
-  if (maxTools >= 0) {
-    const toolIndices: number[] = [];
-    blocks.forEach((b, i) => {
-      if (b.kind === 'tool') toolIndices.push(i);
-    });
-    if (toolIndices.length > maxTools) {
-      const collapseCount = toolIndices.length - maxTools;
-      const collapseSet = new Set(toolIndices.slice(0, collapseCount));
-      const collapsedTools = toolIndices
-        .slice(0, collapseCount)
-        .map((i) => (blocks[i] as { kind: 'tool'; tool: ToolEntry }).tool);
-      const summary = summarizeToolCalls(collapsedTools, state.terminal !== 'running');
-      const summaryBlock: Block = {
-        kind: 'text',
-        content: `${summary.title}\n${summary.body}`,
-        streaming: false,
-      };
-      const rebuilt: Block[] = [];
-      let inserted = false;
-      blocks.forEach((b, i) => {
-        if (collapseSet.has(i)) {
-          if (!inserted) {
-            rebuilt.push(summaryBlock);
-            inserted = true;
-          }
-          return;
-        }
-        rebuilt.push(b);
-      });
-      blocksAfterTools = rebuilt;
-    }
-  }
-
-  // Step 2: trim text from the front (keep the latest) when over maxTextChars.
+  // Trim text from the front (keep the latest) when over maxTextChars.
   let totalText = 0;
-  for (const b of blocksAfterTools) {
+  for (const b of blocks) {
     if (b.kind === 'text') totalText += b.content.length;
   }
-  let finalBlocks = blocksAfterTools;
+  let finalBlocks = blocks;
   let textTruncated = false;
   if (totalText > maxTextChars) {
     textTruncated = true;
     let remaining = maxTextChars;
     const reversedOut: Block[] = [];
-    for (let i = blocksAfterTools.length - 1; i >= 0; i--) {
-      const b = blocksAfterTools[i]!;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i]!;
       if (b.kind !== 'text') {
         reversedOut.push(b);
         continue;

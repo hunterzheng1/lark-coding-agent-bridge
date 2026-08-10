@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { processAgentStream, awaitRenderAwareStream } from '../../../src/bot/channel';
 import type { AgentEvent } from '../../../src/agent/types';
 import type { RunHandle } from '../../../src/bot/active-runs';
+import { renderCard } from '../../../src/card/run-renderer';
 import { initialState } from '../../../src/card/run-state';
 
 function fakeHandle(): RunHandle {
@@ -22,7 +23,7 @@ const noFlush = vi.fn().mockResolvedValue(undefined);
 const noRecord = (_: AgentEvent) => {};
 
 describe('card-stream integration — D + N scenarios (processAgentStream level)', () => {
-  it('D2: only tools, no text → window trims tools, no C2 (fullText empty)', async () => {
+  it('D2: only tools, no text → all tools render in one bounded container, no C2', async () => {
     const evts: AgentEvent[] = [];
     for (let i = 0; i < 12; i++) {
       evts.push({ type: 'tool_use', id: String(i), name: 'Bash', input: {} } as AgentEvent);
@@ -36,7 +37,12 @@ describe('card-stream integration — D + N scenarios (processAgentStream level)
     });
     const lastState = flush.mock.calls[flush.mock.calls.length - 1]![0];
     const toolBlocks = lastState.blocks.filter((b: { kind: string }) => b.kind === 'tool');
-    expect(toolBlocks.length).toBeLessThanOrEqual(8);
+    const card = renderCard(lastState);
+
+    expect(toolBlocks).toHaveLength(12);
+    expect(toolContainerCount(card)).toBe(1);
+    expect(JSON.stringify(card)).toContain('12 个工具调用');
+    expect(JSON.stringify(card).length).toBeLessThan(5_000);
     expect(onTerminal.mock.calls[0]![2]).toBe('');
   });
 
@@ -55,7 +61,7 @@ describe('card-stream integration — D + N scenarios (processAgentStream level)
     expect(fullText).toBe('');
   });
 
-  it('N1: 20 tool pairs + long text → bounded flushes, onTerminal, fullText complete, truncated', async () => {
+  it('N1: 20 tool pairs + long text → one bounded tool container per flush and complete C2', async () => {
     const evts: AgentEvent[] = [];
     for (let i = 0; i < 20; i++) {
       evts.push({ type: 'tool_use', id: String(i), name: 'Read', input: {} } as AgentEvent);
@@ -72,8 +78,15 @@ describe('card-stream integration — D + N scenarios (processAgentStream level)
     for (const call of flush.mock.calls) {
       const s = call[0];
       const toolBlocks = s.blocks.filter((b: { kind: string }) => b.kind === 'tool');
-      expect(toolBlocks.length).toBeLessThanOrEqual(9);
+      const card = renderCard(s);
+
+      expect(toolBlocks.length).toBeGreaterThan(0);
+      expect(toolBlocks.length).toBeLessThanOrEqual(20);
+      expect(toolContainerCount(card)).toBe(1);
+      expect(JSON.stringify(card).length).toBeLessThan(5_000);
     }
+    const lastState = flush.mock.calls[flush.mock.calls.length - 1]![0];
+    expect(lastState.blocks.filter((b: { kind: string }) => b.kind === 'tool')).toHaveLength(20);
     expect(onTerminal.mock.calls[0]![2]).toBe(longText);
     expect(onTerminal.mock.calls[0]![3]).toBe(true);
   });
@@ -121,6 +134,22 @@ describe('card-stream integration — D + N scenarios (processAgentStream level)
     expect(onTerminal.mock.calls[0]![0].terminal).toBe('idle_timeout');
   });
 });
+
+function toolContainerCount(card: object): number {
+  const elements = (card as {
+    body?: {
+      elements?: Array<{
+        tag?: string;
+        header?: { title?: { content?: string } };
+      }>;
+    };
+  }).body?.elements ?? [];
+  return elements.filter(
+    (element) =>
+      element.tag === 'collapsible_panel'
+      && element.header?.title?.content?.includes('工具调用'),
+  ).length;
+}
 
 describe('N5: awaitRenderAwareStream fallback on stream failure', () => {
   it('invokes fallback with final state when the card stream rejects', async () => {

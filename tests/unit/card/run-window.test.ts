@@ -20,7 +20,7 @@ function stateWith(blocks: Block[]): RunState {
 }
 
 describe('windowState', () => {
-  const opts = { maxTools: 3, maxTextChars: 1000 };
+  const opts = { maxTextChars: 1000 };
 
   it('U1: empty state unchanged, truncated false', () => {
     const out = windowState(initialState, opts);
@@ -28,7 +28,7 @@ describe('windowState', () => {
     expect(out.truncated).toBe(false);
   });
 
-  it('U2: tools <= maxTools all kept, no summary', () => {
+  it('U2: tools stay structured and are not converted into text', () => {
     const s = stateWith([toolBlock('1', 'Read'), toolBlock('2', 'Grep'), toolBlock('3', 'Bash')]);
     const out = windowState(s, opts);
     expect(out.blocks.length).toBe(3);
@@ -36,7 +36,7 @@ describe('windowState', () => {
     expect(out.truncated).toBe(false);
   });
 
-  it('U3: tools > maxTools collapse oldest into bounded summary, keep latest', () => {
+  it('U3: all tools stay structured so the renderer can aggregate them once', () => {
     const s = stateWith([
       toolBlock('1', 'Read'),
       toolBlock('2', 'Grep'),
@@ -49,28 +49,18 @@ describe('windowState', () => {
       kind: 'tool';
       tool: ToolEntry;
     }[];
-    expect(toolBlocks.length).toBe(3);
-    expect(toolBlocks.map((b) => b.tool.id)).toEqual(['3', '4', '5']);
-    const summary = out.blocks.find((b) => b.kind === 'text') as
-      | { kind: 'text'; content: string }
-      | undefined;
-    expect(summary).toBeTruthy();
-    expect(summary!.content).toContain('2 个工具调用');
+    expect(toolBlocks.length).toBe(5);
+    expect(toolBlocks.map((b) => b.tool.id)).toEqual(['1', '2', '3', '4', '5']);
+    expect(out.blocks.some((b) => b.kind === 'text')).toBe(false);
   });
 
-  it('U3b: 57 tools do not expand the 49 collapsed tool names line by line', () => {
+  it('U3b: any number of tools stays in one structured stream for global aggregation', () => {
     const tools = Array.from({ length: 57 }, (_, index) =>
       toolBlock(String(index + 1), `OldTool${String(index + 1).padStart(2, '0')}`),
     );
-    const out = windowState(stateWith(tools), { maxTools: 8, maxTextChars: 10_000 });
-    const summary = out.blocks.find((b) => b.kind === 'text') as
-      | { kind: 'text'; content: string }
-      | undefined;
-
-    expect(summary).toBeTruthy();
-    expect(summary!.content).toContain('49 个工具调用');
-    expect(summary!.content.match(/OldTool/g)?.length ?? 0).toBeLessThanOrEqual(7);
-    expect(summary!.content).not.toContain('\n- ');
+    const out = windowState(stateWith(tools), { maxTextChars: 10_000 });
+    expect(out.blocks).toHaveLength(57);
+    expect(out.blocks.every((block) => block.kind === 'tool')).toBe(true);
   });
 
   it('U4: text under maxTextChars unchanged, truncated false', () => {
