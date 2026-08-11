@@ -1,15 +1,13 @@
 # lark-channel-bridge
 
-把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
+把飞书 / Lark 消息连接到本地 Claude Code、Codex CLI 或 CodeBuddy Code 的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
 
 [English README](./README.md)
 
-关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
-
 ## 主要功能
 
-- 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code / Codex CLI。
-- **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。
+- 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code、Codex CLI 或 CodeBuddy Code。
+- **流式卡片**：文本回复实时更新在同一张卡片上。无论调用多少次工具，所有工具调用都收纳在一个折叠工具容器中，仅保留当前、最近和失败调用的有界摘要。
 - **会话延续**：每个聊天、话题或文档评论有自己的会话，不会互相串。
 - **排队与消息合并**：短时间连续发送的消息会合并处理；任务运行中收到的普通消息会排队到下一轮，`/new`、`/cd`、`/ws use`、`/stop` 这类命令可以中断当前任务。
 - **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
@@ -22,6 +20,7 @@
 - 本机至少安装并登录一个 agent：
   - Claude Code：`claude`，安装说明：https://docs.anthropic.com/en/docs/claude-code/quickstart
   - Codex CLI：`codex`，安装说明：https://developers.openai.com/codex/cli
+  - CodeBuddy Code：`codebuddy`（别名 `cbc`）。如需指定二进制文件，设置 `LARK_CHANNEL_CODEBUDDY_BIN`。
 - 一个飞书 / Lark PersonalAgent 应用。首次启动的扫码向导可以帮你创建并绑定。
 
 ## 安装
@@ -83,17 +82,18 @@ lark-channel-bridge unregister [--profile <name>]
 平台映射：
 - **macOS**：launchd 用户代理 `ai.lark-channel-bridge.bot.<profile>`
 - **Linux**：systemd 用户单元 `lark-channel-bridge.bot.<profile>.service`
-- **Windows**：Task Scheduler 任务 `LarkChannelBridge.Bot.<profile>`，launcher 是 `.cmd`
+- **Windows**：Task Scheduler 任务 `LarkChannelBridge.Bot.<profile>`。任务操作先运行 `wscript.exe`，再通过隐藏的 `.vbs` 包装器启动可重试的 `.cmd` launcher。登录触发器等待一分钟，以便网络就绪；bridge 非零退出后，launcher 等待 15 秒再重试。
 
 daemon 日志在 `~/.lark-channel/profiles/<profile>/logs/daemon/`。
 
-### 多 profile：分别运行 Claude 和 Codex
+### 多 profile：分别运行 Claude、Codex 和 CodeBuddy
 
-默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 profile：
+默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude、Codex 和 CodeBuddy 时，才需要创建多个 profile：
 
 ```bash
 lark-channel-bridge start --profile claude --agent claude
 lark-channel-bridge start --profile codex --agent codex
+lark-channel-bridge start --profile codebuddy --agent codebuddy
 ```
 
 例如只重启 Codex bot：
@@ -108,13 +108,13 @@ lark-channel-bridge status --profile codex
 ### 宿主 CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge start [--profile <name>] [--agent claude|codex] [--app-id <id>]
+lark-channel-bridge run [--profile <name>] [--agent claude|codex|codebuddy] [--workspace <path>] [-c <config>]
+lark-channel-bridge start [--profile <name>] [--agent claude|codex|codebuddy] [--app-id <id>]
 lark-channel-bridge stop [--profile <name>]
 lark-channel-bridge restart [--profile <name>]
 lark-channel-bridge status [--profile <name>]
 lark-channel-bridge unregister [--profile <name>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
+lark-channel-bridge migrate [--profile <name>] [--agent claude|codex|codebuddy]
 lark-channel-bridge profile <list|create|use|remove|export>   # 见下文
 lark-channel-bridge secrets <get|set|list|remove>             # 管理加密的 app secret
 lark-channel-bridge ps
@@ -122,11 +122,12 @@ lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
 ```
 
-`profile use <name>` 会切换后续默认启动使用的 profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，再使用这些 profile 管理命令：
+`profile use <name>` 会切换后续默认启动使用的 profile。需要同时运行 Claude、Codex 和 CodeBuddy bot、连接多套 PersonalAgent 应用，或做脚本化部署时，再使用这些 profile 管理命令：
 
 ```bash
 lark-channel-bridge profile create claude --agent claude
 lark-channel-bridge profile create codex --agent codex
+lark-channel-bridge profile create codebuddy --agent codebuddy
 lark-channel-bridge profile list
 lark-channel-bridge profile use <name>
 lark-channel-bridge profile remove <name>
@@ -144,12 +145,13 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | 命令 | 作用 |
 |---|---|
 | `/new`, `/reset` | 清空当前会话 |
+| `/new chat [name]` | 新建群聊和会话，并邀请发起用户进入群聊 |
 | `/cd <path>` | 切换工作目录并重置会话 |
 | `/ws list` | 列出命名工作空间 |
 | `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
 | `/ws use <name>` | 切换到命名工作空间 |
 | `/ws remove <name>` | 删除命名工作空间 |
-| `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
+| `/resume` | 恢复同 agent、工作目录和权限模式兼容的历史会话。CodeBuddy 通过 catalog `sessionId` 续聊；暂不支持浏览 CodeBuddy 原生历史目录，因此候选列表可能为空 |
 | `/last [N]` | 查看上一条 run 的最后 N 行输出（默认 20） |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
@@ -160,10 +162,12 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/invite all group` | 允许 bot 所在的所有群使用 |
 | `/remove user @某人`, `/remove admin @某人`, `/remove group` | 移除访问控制条目 |
 | `/stop` | 停止当前 run，也可点卡片停止按钮 |
+| `/stop comment:<scopeHash>` | 由管理员停止云文档评论任务 |
 | `/timeout [N\|off\|default]` | 设置或清除当前会话的 idle watchdog |
+| `/timeout comment:<scopeHash> N` | 由管理员设置云文档评论任务的 idle watchdog |
 | `/ps` | 列出本机 bridge 进程 |
 | `/exit <id\|#>` | 停止指定 bridge 进程 |
-| `/reconnect` | 强制 WebSocket 重连 |
+| `/reconnect [--wait]` | 立即重连 WebSocket；加 `--wait` 时，等待当前运行结束后再重连 |
 | `/doctor [描述]` | 执行低敏诊断 |
 | `/doc` | 提示：云文档评论无需绑定工作区，在支持的文档评论 @bot 即可触发 |
 | `/help` | 帮助卡片 |
@@ -304,9 +308,13 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 
 ## 常见问题
 
-**bot 没反应 / agent 不回复**：通常是本机 `claude` 或 `codex` CLI 没登录，或者当前会话指向了不存在的工作目录。发 `/status` 看当前状态；`/new` 重开会话往往就好。
+**bot 没反应 / agent 不回复**：通常是本机 `claude`、`codex` 或 `codebuddy` CLI 没登录，或者当前会话指向了不存在的工作目录。发送 `/status` 查看当前状态；发送 `/new` 可以新建会话。
 
 **agent 子进程假死（卡片停在最后一帧不动）**：支持 idle 探活。agent 一段时间没输出就会被 SIGTERM kill，卡片末尾会标出自动终止原因。默认关闭。开启方式：`/config` 设全局值（分钟），或 `/timeout 10` 只对当前会话生效；`/timeout off` 关掉当前会话的探活；`/timeout default` 清掉会话覆盖，回退到全局设置。
+
+**为什么卡片不展示每次工具调用的完整输入和输出**：从 v0.3.15 开始，无论工具调用数量多少，整次运行都只使用一个折叠工具容器。容器使用有界摘要，避免长任务超过飞书卡片限制；完整工具详情仍保存在结构化运行日志中，可在本机检查。
+
+**Windows 任务已停止，但旧 bot 仍然回复**：bridge 子进程可能比 `wscript.exe` 包装器存活得更久。先运行 `lark-channel-bridge ps`，再用 `lark-channel-bridge kill <id|#>` 停止对应进程。确认旧进程已退出后，运行 `lark-channel-bridge start --profile <name>`。清理前不要启动第二个实例，否则可能发生 profile 或 app 锁冲突。
 
 **图片发过去 agent 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。
 

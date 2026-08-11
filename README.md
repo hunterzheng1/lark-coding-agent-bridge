@@ -4,12 +4,10 @@ A lightweight bot that bridges Feishu / Lark messenger with your local Claude Co
 
 [中文 README](./README.zh.md)
 
-For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
-
 ## What it does
 
-- Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
-- **Streaming card**: text replies and tool calls update on one Lark card in real time.
+- Forwards Feishu / Lark messages to local Claude Code, Codex CLI, or CodeBuddy Code. Send a DM directly, or `@bot` in a group.
+- **Streaming card**: text replies update on one Lark card in real time. Regardless of count, all tool calls stay in one collapsed tool container with a bounded summary of current, recent, and failed calls.
 - **Session continuity**: each chat, topic, or document comment thread keeps its own session.
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
@@ -84,13 +82,13 @@ lark-channel-bridge unregister [--profile <name>]
 Platform mapping:
 - **macOS**: launchd user agent `ai.lark-channel-bridge.bot.<profile>`
 - **Linux**: systemd user unit `lark-channel-bridge.bot.<profile>.service`
-- **Windows**: Task Scheduler task `LarkChannelBridge.Bot.<profile>`, launched through a `.cmd` wrapper
+- **Windows**: Task Scheduler task `LarkChannelBridge.Bot.<profile>`. Its action runs `wscript.exe`, which opens a hidden `.vbs` wrapper and then a retrying `.cmd` launcher. The on-logon trigger waits one minute for the network, and a non-zero bridge exit is retried after 15 seconds.
 
 Daemon logs are under `~/.lark-channel/profiles/<profile>/logs/daemon/`.
 
-### Multiple profiles: Claude and Codex
+### Multiple profiles: Claude, Codex, and CodeBuddy
 
-By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
+By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude, Codex, and CodeBuddy as separate bots:
 
 ```bash
 lark-channel-bridge start --profile claude --agent claude
@@ -124,7 +122,7 @@ lark-channel-bridge kill <id|#>
 lark-channel-bridge --help
 ```
 
-`profile use <name>` changes the profile used by later default starts. Use these profile management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
+`profile use <name>` changes the profile used by later default starts. Use these profile management commands when running separate Claude / Codex / CodeBuddy bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
 
 ```bash
 lark-channel-bridge profile create claude --agent claude
@@ -147,6 +145,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | Command | Effect |
 |---|---|
 | `/new`, `/reset` | Clear the current session |
+| `/new chat [name]` | Create a group chat with a fresh session and invite the requesting user |
 | `/cd <path>` | Switch working directory and reset the session |
 | `/ws list` | List named workspaces |
 | `/ws save <name>` | Save the current working directory as a named workspace |
@@ -163,10 +162,12 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/invite all group` | Allow all groups the bot has joined |
 | `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
 | `/stop` | Stop the current run, including the card stop button |
+| `/stop comment:<scopeHash>` | Let an admin stop a cloud-doc comment run |
 | `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
+| `/timeout comment:<scopeHash> N` | Let an admin set the idle watchdog for a cloud-doc comment run |
 | `/ps` | List local bridge processes |
 | `/exit <id\|#>` | Stop a bridge process |
-| `/reconnect` | Force a WebSocket reconnect |
+| `/reconnect [--wait]` | Reconnect the WebSocket now, or wait for active runs to finish with `--wait` |
 | `/doctor [description]` | Run low-sensitive diagnostics |
 | `/doc` | Reminder: cloud-doc comments need no workspace binding; @bot in a supported doc to trigger |
 | `/help` | Help card |
@@ -310,6 +311,10 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 **The bot stays silent or the local CLI never replies.** Usually the local `claude`, `codex`, or `codebuddy` CLI is not logged in, or the current session points to a working directory that no longer exists. Send `/status` to inspect; `/new` often fixes it by starting a fresh session.
 
 **The agent subprocess looks frozen (card stuck on the last frame).** The bridge supports an idle watchdog: if the agent emits nothing for N minutes, the process is killed and the card is annotated with the auto-termination reason. Disabled by default. Enable with `/config` globally, or `/timeout 10` for the current session; `/timeout off` disables it for the session; `/timeout default` clears the session override.
+
+**Why does the card not show every tool input and output?** Since v0.3.15, every run uses one collapsed tool container regardless of tool count. The container keeps a bounded summary so long runs cannot exceed Feishu card limits; complete tool details remain in the structured run log for local inspection.
+
+**A Windows task is stopped, but the old bot still replies.** A bridge child process can outlive the `wscript.exe` wrapper. Run `lark-channel-bridge ps`, stop the matching process with `lark-channel-bridge kill <id|#>`, confirm the old process is gone, and then run `lark-channel-bridge start --profile <name>`. Starting another copy before cleanup can cause profile or app lock conflicts.
 
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.
 

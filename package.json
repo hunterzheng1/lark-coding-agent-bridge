@@ -1,6 +1,6 @@
 {
   "name": "@hunterzheng/lark-channel-bridge",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -75,6 +75,8 @@
     "claude",
     "claude-code",
     "codex",
+    "codebuddy",
+    "codebuddy-code",
     "cli",
     "channel",
     "bridge"

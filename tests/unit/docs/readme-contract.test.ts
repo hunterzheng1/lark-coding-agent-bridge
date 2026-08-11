@@ -3,10 +3,9 @@ import { describe, expect, it } from 'vitest';
 
 describe('README runtime contract', () => {
   it('documents maintained runtime surfaces in user-visible docs', async () => {
-    const docs = await readDocs();
+    const { en, zh } = await readLocalizedDocs();
 
     for (const phrase of [
-      'per-profile service',
       'workspaces.default',
       '/invite user',
       '/remove user',
@@ -19,16 +18,44 @@ describe('README runtime contract', () => {
       'profile remove',
       '--purge --yes',
       '--include-secrets --yes',
-      'lark-cli identity policy',
-      'profile-local lark-cli directory',
-      'lark-cli 身份策略',
-      '当前 profile 的 lark-cli 目录',
       'pnpm test',
       'pnpm typecheck',
       'pnpm build',
     ]) {
-      expect(docs).toContain(phrase);
+      expect(en).toContain(phrase);
+      expect(zh).toContain(phrase);
     }
+
+    expect(en).toContain('per-profile service');
+    expect(en).toContain('lark-cli identity policy');
+    expect(en).toContain('profile-local lark-cli directory');
+    expect(zh).toContain('每个 profile 有独立服务');
+    expect(zh).toContain('lark-cli 身份策略');
+    expect(zh).toContain('当前 profile 的 lark-cli 目录');
+  });
+
+  it('keeps both localized READMEs aligned with current agent and runtime behavior', async () => {
+    const { en, zh } = await readLocalizedDocs();
+
+    for (const docs of [en, zh]) {
+      expect(docs).toContain('CodeBuddy Code');
+      expect(docs).toContain('--agent claude|codex|codebuddy');
+      expect(docs).toContain('wscript.exe');
+      expect(docs).toContain('.vbs');
+      expect(docs).toContain('/new chat [name]');
+      expect(docs).toContain('/stop comment:<scopeHash>');
+      expect(docs).toContain('/timeout comment:<scopeHash>');
+    }
+
+    expect(en).toContain('one collapsed tool container');
+    expect(en).toContain("CodeBuddy's native history directory is not supported yet");
+    expect(zh).toContain('一个折叠工具容器');
+    expect(zh).toContain('暂不支持浏览 CodeBuddy 原生历史目录');
+
+    const staleUpstreamWalkthrough =
+      'https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e';
+    expect(en).not.toContain(staleUpstreamWalkthrough);
+    expect(zh).not.toContain(staleUpstreamWalkthrough);
   });
 
   it('keeps CLI help aligned with profile-aware service and first-run workspace flags', async () => {
@@ -94,9 +121,14 @@ describe('README runtime contract', () => {
 });
 
 async function readDocs(): Promise<string> {
+  const { en, zh } = await readLocalizedDocs();
+  return `${en}\n${zh}`;
+}
+
+async function readLocalizedDocs(): Promise<{ en: string; zh: string }> {
   const [en, zh] = await Promise.all([
     readFile(new URL('../../../README.md', import.meta.url), 'utf8'),
     readFile(new URL('../../../README.zh.md', import.meta.url), 'utf8'),
   ]);
-  return `${en}\n${zh}`;
+  return { en, zh };
 }
