@@ -314,6 +314,8 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 
 **Why does the card not show every tool input and output?** Since v0.3.15, every run uses one collapsed tool container regardless of tool count. The container keeps a bounded summary so long runs cannot exceed Feishu card limits; complete tool details remain in the structured run log for local inspection.
 
+**Why does the card remain active after the last tool finishes?** A completed tool is not the same as a completed agent run. From v0.3.17, after the final tool result the footer changes to **Wrapping up** (`正在收尾`) while the bridge waits for the agent's terminal event. The Stop button remains available during this state. If the card stays there, inspect the agent's Stop Hook or local CLI logs; the bridge does not report success before the process actually finishes.
+
 **A Windows task is stopped, but the old bot still replies.** A bridge child process can outlive the `wscript.exe` wrapper. Run `lark-channel-bridge ps`, stop the matching process with `lark-channel-bridge kill <id|#>`, confirm the old process is gone, and then run `lark-channel-bridge start --profile <name>`. Starting another copy before cleanup can cause profile or app lock conflicts.
 
 **The agent says it cannot see an image I sent.** Upgrade to the latest version. Releases before 0.1.0 had a filename-dedup bug.

@@ -48,8 +48,10 @@ describe('README runtime contract', () => {
     }
 
     expect(en).toContain('one collapsed tool container');
+    expect(en).toContain('Wrapping up');
     expect(en).toContain("CodeBuddy's native history directory is not supported yet");
     expect(zh).toContain('一个折叠工具容器');
+    expect(zh).toContain('正在收尾');
     expect(zh).toContain('暂不支持浏览 CodeBuddy 原生历史目录');
 
     const staleUpstreamWalkthrough =

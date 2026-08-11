@@ -161,7 +161,9 @@ function footerStatus(status: Exclude<FooterStatus, null>): object {
       ? '🧠 正在思考'
       : status === 'tool_running'
         ? '🧰 正在调用工具'
-        : '✍️ 正在输出';
+        : status === 'streaming'
+          ? '✍️ 正在输出'
+          : '⏳ 正在收尾';
   return noteMd(text);
 }
 
@@ -189,6 +191,7 @@ function summaryText(state: RunState): string {
   if (state.terminal === 'done') return '已完成';
   if (state.footer === 'tool_running') return '正在调用工具';
   if (state.footer === 'streaming') return '正在输出';
+  if (state.footer === 'closing') return '正在收尾';
   return '思考中';
 }
 

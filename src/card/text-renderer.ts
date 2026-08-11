@@ -49,8 +49,9 @@ function toolSummaryQuote(tools: ToolEntry[], finalized: boolean): string {
     .join('\n');
 }
 
-function footerLine(status: 'thinking' | 'tool_running' | 'streaming'): string {
+function footerLine(status: Exclude<RunState['footer'], null>): string {
   if (status === 'thinking') return '_🧠 正在思考…_';
   if (status === 'tool_running') return '_🧰 正在调用工具…_';
-  return '_✍️ 正在输出…_';
+  if (status === 'streaming') return '_✍️ 正在输出…_';
+  return '_⏳ 正在收尾…_';
 }

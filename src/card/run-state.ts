@@ -14,7 +14,7 @@ export type Block =
   | { kind: 'text'; content: string; streaming: boolean }
   | { kind: 'tool'; tool: ToolEntry };
 
-export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | null;
+export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | 'closing' | null;
 export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
 
 export interface RunState {
@@ -104,7 +104,10 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
           },
         };
       });
-      return { ...state, blocks };
+      const hasRunningTool = blocks.some(
+        (block) => block.kind === 'tool' && block.tool.status === 'running',
+      );
+      return { ...state, blocks, footer: hasRunningTool ? 'tool_running' : 'closing' };
     }
 
     case 'error': {

@@ -314,6 +314,8 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 
 **为什么卡片不展示每次工具调用的完整输入和输出**：从 v0.3.15 开始，无论工具调用数量多少，整次运行都只使用一个折叠工具容器。容器使用有界摘要，避免长任务超过飞书卡片限制；完整工具详情仍保存在结构化运行日志中，可在本机检查。
 
+**为什么最后一个工具结束后，卡片仍处于运行状态**：工具执行完成不等于 agent 运行结束。从 v0.3.17 开始，bridge 收到最后一个工具结果后，卡片底部改为「正在收尾」，并继续等待 agent 的终止事件。此时「终止」按钮仍然可用。如果卡片长时间停在「正在收尾」，检查 agent 的 Stop Hook 或本机 CLI 日志；bridge 不会在进程实际结束前提前显示成功。
+
 **Windows 任务已停止，但旧 bot 仍然回复**：bridge 子进程可能比 `wscript.exe` 包装器存活得更久。先运行 `lark-channel-bridge ps`，再用 `lark-channel-bridge kill <id|#>` 停止对应进程。确认旧进程已退出后，运行 `lark-channel-bridge start --profile <name>`。清理前不要启动第二个实例，否则可能发生 profile 或 app 锁冲突。
 
 **图片发过去 agent 说看不到**：升级到最新版，0.1.0 之前的版本有文件名去重 bug。

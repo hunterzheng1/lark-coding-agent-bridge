@@ -44,6 +44,21 @@ describe('run card renderer snapshots', () => {
     ])).toMatchSnapshot();
   });
 
+  it('shows a closing footer after the final tool result while the run is still active', () => {
+    const state = stateFrom([
+      { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+      { type: 'tool_result', id: 'tool-1', output: '/repo', isError: false },
+    ]);
+    const card = JSON.stringify(renderCard(state));
+    const text = renderText(state);
+
+    expect(state.terminal).toBe('running');
+    expect(card).toContain('正在收尾');
+    expect(text).toContain('正在收尾');
+    expect(card).not.toContain('正在调用工具');
+    expect(text).not.toContain('正在调用工具');
+  });
+
   it('collapses consecutive tools while preserving the latest running tool', () => {
     expectCard(stateFrom([
       { type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
