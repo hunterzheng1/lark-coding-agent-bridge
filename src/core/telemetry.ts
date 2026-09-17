@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import type { LogContext, LogFields } from './logger';
 
 /**
@@ -147,7 +148,15 @@ export async function loadTelemetryAdapter(meta: AdapterMeta): Promise<void> {
 }
 
 function normalizeModuleSpecifier(specifier: string): string {
-  return specifier.startsWith('file:') ? specifier.replace(/%7E/gi, '~') : specifier;
+  if (!specifier.startsWith('file:')) return specifier;
+  // Convert file: URLs to plain absolute paths. Node accepts both, but
+  // percent-encoded URLs (%20 for spaces, %E4.. for unicode) fail to resolve
+  // under vite-node — and Windows temp/config paths with spaces are common.
+  try {
+    return fileURLToPath(specifier);
+  } catch {
+    return specifier.replace(/%7E/gi, '~');
+  }
 }
 
 /** The active adapter — noop until/unless `loadTelemetryAdapter` installs one. */
