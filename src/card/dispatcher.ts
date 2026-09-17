@@ -31,6 +31,7 @@ export interface CardDispatchDeps {
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   thinkingHistory?: ThinkingHistoryStore;
+  inboundJournal?: { clearQueued(scope: string): Promise<void> };
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
@@ -100,6 +101,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       sessions: deps.sessions,
       sessionCatalog: deps.sessionCatalog,
       thinkingHistory: deps.thinkingHistory,
+      inboundJournal: deps.inboundJournal,
       sessionCatalogIdentity: await commandSessionCatalogIdentity({
         msg,
         scope,

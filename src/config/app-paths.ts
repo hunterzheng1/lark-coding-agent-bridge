@@ -26,6 +26,8 @@ export interface AppPaths {
   logsDir: string;
   /** Per-run thinking records queried via /thinking (OPT-01B). */
   thinkingDir: string;
+  /** Inbound message journal (OPT-04 restart durability). */
+  inboundDir: string;
   registryDir: string;
   userRegistryFile: string;
   userLockDir: string;
@@ -61,6 +63,7 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     mediaDir: join(profileDir, 'media'),
     logsDir: join(profileDir, 'logs'),
     thinkingDir: join(profileDir, 'thinking'),
+    inboundDir: join(profileDir, 'inbound'),
     registryDir,
     userRegistryFile: join(registryDir, 'processes.json'),
     userLockDir,

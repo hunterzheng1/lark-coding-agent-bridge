@@ -126,6 +126,9 @@ export interface CommandContext {
   /** Per-run thinking records backing /thinking (OPT-01B). Optional so
    * test harnesses can omit it; /thinking degrades gracefully. */
   thinkingHistory?: ThinkingHistoryStore;
+  /** Inbound message journal (OPT-04). /new clears queued records for the
+   * scope; optional so test harnesses can omit it. */
+  inboundJournal?: { clearQueued(scope: string): Promise<void> };
   sessionCatalogIdentity?: SessionCatalogIdentity;
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
@@ -326,6 +329,9 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
     });
   }
   ctx.sessions.clear(ctx.scope);
+  // OPT-04: /new means "fresh start" — queued (never-dispatched) messages for
+  // this scope must not replay after a restart.
+  await ctx.inboundJournal?.clearQueued(ctx.scope).catch(() => undefined);
   await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
 }
 

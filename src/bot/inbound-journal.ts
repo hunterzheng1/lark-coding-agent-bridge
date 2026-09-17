@@ -1,0 +1,261 @@
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { log } from '../core/logger';
+import { writeFileAtomic } from '../platform/atomic-write';
+
+/**
+ * Write-ahead journal for inbound messages (OPT-04).
+ *
+ * Messages are journaled when accepted, before they enter the in-memory
+ * PendingQueue — a crash or restart can no longer silently drop them. Status
+ * tracks the delivery pipeline: `queued` (accepted, never dispatched), then
+ * `claimed` (dispatched into a run — side effects may exist), then
+ * `terminal` (run reached a known end). A `claimed` record without a terminal
+ * event is `uncertain` on recovery: the run's outcome is unknown, so it is
+ * never auto-rerun (OPT-04 recovery principle). `expired` marks queued
+ * records too old to re-dispatch responsibly.
+ *
+ * Records are keyed Profile (implicit) + scope + platform messageId; duplicate
+ * delivery of the same event is a no-op. One JSON file per scope, atomic
+ * writes, 0600 — same durability pattern as SessionStore.
+ */
+
+export type InboundStatus = 'queued' | 'claimed' | 'terminal' | 'uncertain' | 'expired';
+
+export interface InboundRecord {
+  messageId: string;
+  scope: string;
+  chatId: string;
+  senderId: string;
+  content: string;
+  acceptedAt: number;
+  status: InboundStatus;
+  threadId?: string;
+  chatType?: 'p2p' | 'group';
+  runId?: string;
+  claimedAt?: number;
+  settledAt?: number;
+  /** Set when the run reached a known terminal state. */
+  terminalState?: string;
+}
+
+export interface InboundJournalLimits {
+  maxAgeMs: number;
+  /** Queued records younger than this may be re-dispatched on startup. */
+  requeueMaxAgeMs: number;
+}
+
+export const DEFAULT_INBOUND_LIMITS: Readonly<InboundJournalLimits> = {
+  maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+  requeueMaxAgeMs: 10 * 60 * 1000,
+};
+
+export interface RecoverySets {
+  requeue: InboundRecord[];
+  uncertain: InboundRecord[];
+  expired: InboundRecord[];
+}
+
+interface JournalFile {
+  version: 1;
+  records: InboundRecord[];
+}
+
+export class InboundJournal {
+  private readonly limits: InboundJournalLimits;
+  private readonly records = new Map<string, InboundRecord>(); // `${scope}\u0000${messageId}`
+  private readonly persistQueue = new Map<string, Promise<boolean>>();
+
+  constructor(
+    private readonly dir: string,
+    limits: Partial<InboundJournalLimits> = {},
+    private readonly now: () => number = Date.now,
+  ) {
+    this.limits = { ...DEFAULT_INBOUND_LIMITS, ...limits };
+  }
+
+  async load(): Promise<void> {
+    let files: string[];
+    try {
+      files = await readdir(this.dir);
+    } catch {
+      return; // first boot — nothing journaled yet
+    }
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      try {
+        const raw = JSON.parse(await readFile(join(this.dir, file), 'utf8')) as JournalFile;
+        if (raw.version !== 1 || !Array.isArray(raw.records)) continue;
+        for (const record of raw.records) {
+          if (!record || typeof record.messageId !== 'string' || typeof record.scope !== 'string') {
+            continue;
+          }
+          this.records.set(key(record.scope, record.messageId), record);
+        }
+      } catch (err) {
+        log.warn('inbound', 'load-corrupt-skipped', {
+          file,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
+  /**
+   * Journal an accepted message before it enters the in-memory queue.
+   * Resolves 'failed' when persistence failed — callers must not claim
+   * durable receipt in that case. 'duplicate' is the idempotent no-op for a
+   * redelivered event.
+   */
+  async recordAccepted(input: {
+    messageId: string;
+    scope: string;
+    chatId: string;
+    senderId: string;
+    content: string;
+    acceptedAt: number;
+    threadId?: string;
+    chatType?: 'p2p' | 'group';
+  }): Promise<'recorded' | 'duplicate' | 'failed'> {
+    const k = key(input.scope, input.messageId);
+    if (this.records.has(k)) return 'duplicate'; // duplicate delivery — idempotent
+    try {
+      await mkdir(this.dir, { recursive: true });
+    } catch (err) {
+      log.fail('inbound', err, { step: 'mkdir', scope: input.scope });
+      return 'failed';
+    }
+    this.records.set(k, {
+      ...input,
+      status: 'queued',
+    });
+    return (await this.persistScope(input.scope)) ? 'recorded' : 'failed';
+  }
+
+  async markClaimed(scope: string, messageIds: readonly string[], runId: string): Promise<void> {
+    let touched = false;
+    for (const messageId of messageIds) {
+      const record = this.records.get(key(scope, messageId));
+      if (!record || record.status !== 'queued') continue;
+      record.status = 'claimed';
+      record.runId = runId;
+      record.claimedAt = this.now();
+      touched = true;
+    }
+    if (touched) await this.persistScope(scope);
+  }
+
+  async markTerminal(scope: string, runId: string, terminal: string): Promise<void> {
+    const now = this.now();
+    let touched = false;
+    for (const record of this.records.values()) {
+      if (record.scope !== scope || record.runId !== runId) continue;
+      record.status = 'terminal';
+      record.settledAt = now;
+      record.terminalState = terminal;
+      touched = true;
+    }
+    if (touched) await this.persistScope(scope);
+  }
+
+  /**
+   * Settle queued records whose intake was rejected (policy denial etc.) so a
+   * restart does not replay them into the same rejection.
+   */
+  async markRejected(scope: string, messageIds: readonly string[]): Promise<void> {
+    const now = this.now();
+    let touched = false;
+    for (const messageId of messageIds) {
+      const record = this.records.get(key(scope, messageId));
+      if (!record || record.status !== 'queued') continue;
+      record.status = 'terminal';
+      record.settledAt = now;
+      record.terminalState = 'rejected';
+      touched = true;
+    }
+    if (touched) await this.persistScope(scope);
+  }
+
+  /** /new semantics: drop queued (never-dispatched) records for the scope. */
+  async clearQueued(scope: string): Promise<void> {
+    let touched = false;
+    for (const [k, record] of [...this.records]) {
+      if (record.scope === scope && record.status === 'queued') {
+        this.records.delete(k);
+        touched = true;
+      }
+    }
+    if (touched) await this.persistScope(scope);
+  }
+
+  list(scope: string): InboundRecord[] {
+    return [...this.records.values()]
+      .filter((r) => r.scope === scope && this.now() - r.acceptedAt <= this.limits.maxAgeMs)
+      .sort((a, b) => a.acceptedAt - b.acceptedAt);
+  }
+
+  /**
+   * Classify journal leftovers at startup. Queued records inside the
+   * re-dispatch window are safe to run again (they never spawned an agent);
+   * claimed records without a known terminal are uncertain — the run's
+   * outcome and side effects are unknown, so they are reported, never rerun.
+   */
+  async recoverOnStartup(): Promise<RecoverySets> {
+    const now = this.now();
+    const sets: RecoverySets = { requeue: [], uncertain: [], expired: [] };
+    let touched = false;
+    for (const record of this.records.values()) {
+      if (record.status === 'terminal') continue; // pruned lazily by retention
+      if (this.now() - record.acceptedAt > this.limits.maxAgeMs) continue;
+      if (record.status === 'queued') {
+        if (now - record.acceptedAt <= this.limits.requeueMaxAgeMs) {
+          sets.requeue.push(record);
+        } else {
+          record.status = 'expired';
+          record.settledAt = now;
+          sets.expired.push(record);
+          touched = true;
+        }
+      } else if (record.status === 'claimed') {
+        record.status = 'uncertain';
+        record.settledAt = now;
+        sets.uncertain.push(record);
+        touched = true;
+      }
+    }
+    if (touched) {
+      const scopes = new Set([...sets.uncertain, ...sets.expired].map((r) => r.scope));
+      for (const scope of scopes) await this.persistScope(scope);
+    }
+    return sets;
+  }
+
+  async flush(): Promise<void> {
+    await Promise.all([...this.persistQueue.values()]);
+  }
+
+  private async persistScope(scope: string): Promise<boolean> {
+    const records = [...this.records.values()]
+      .filter((r) => r.scope === scope)
+      .sort((a, b) => a.acceptedAt - b.acceptedAt);
+    const file: JournalFile = { version: 1, records };
+    try {
+      await writeFileAtomic(this.fileFor(scope), `${JSON.stringify(file)}\n`, { mode: 0o600 });
+      return true;
+    } catch (err) {
+      log.fail('inbound', err, { step: 'persist', scope });
+      return false;
+    }
+  }
+
+  private fileFor(scope: string): string {
+    const prefix = scope.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 60);
+    const hash = createHash('sha256').update(scope).digest('hex').slice(0, 12);
+    return join(this.dir, `inbound-${prefix}-${hash}.json`);
+  }
+}
+
+function key(scope: string, messageId: string): string {
+  return `${scope}\u0000${messageId}`;
+}

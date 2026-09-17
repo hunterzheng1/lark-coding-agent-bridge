@@ -66,6 +66,7 @@ import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
+import { InboundJournal, type InboundRecord } from './inbound-journal';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -180,12 +181,13 @@ export interface StartChannelDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   thinkingHistory?: ThinkingHistoryStore;
+  inboundJournal?: InboundJournal;
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
-  const { cfg, agent, sessions, sessionCatalog, workspaces, thinkingHistory, controls } = deps;
+  const { cfg, agent, sessions, sessionCatalog, workspaces, thinkingHistory, inboundJournal, controls } = deps;
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -277,6 +279,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessionCatalog,
           workspaces,
           thinkingHistory,
+          inboundJournal,
           media,
           batch,
           controls,
@@ -294,6 +297,56 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     });
   });
 
+  // OPT-04 startup recovery: journal leftovers from a previous process.
+  // Queued (never-dispatched) messages are replayed through the normal
+  // pending flow — fresh policy checks at dispatch. Claimed records whose run
+  // has no known terminal state are `uncertain`: notified, never auto-rerun.
+  if (inboundJournal) {
+    void (async () => {
+      try {
+        const recovery = await inboundJournal.recoverOnStartup();
+        // Give the WS handshake a moment before replaying or notifying.
+        await new Promise((r) => setTimeout(r, 1_500));
+        for (const record of recovery.requeue) {
+          log.info('inbound', 'recovery-requeue', {
+            scope: record.scope,
+            messageId: record.messageId,
+          });
+          pending.push(record.scope, recoveryMessage(record));
+        }
+        for (const record of recovery.uncertain) {
+          log.warn('inbound', 'recovery-uncertain', {
+            scope: record.scope,
+            messageId: record.messageId,
+            runId: record.runId,
+          });
+          void channel
+            .send(
+              record.chatId,
+              {
+                markdown: `⚠️ 上次进程中断，消息「${previewContent(record.content)}」的执行结果未知，未自动重跑。可重新发送该任务，或 /doctor 查看日志。`,
+              },
+              record.threadId ? { replyInThread: true as const } : undefined,
+            )
+            .catch((err) => log.fail('inbound', err, { step: 'recovery-notice' }));
+        }
+        for (const record of recovery.expired) {
+          void channel
+            .send(
+              record.chatId,
+              {
+                markdown: `⚠️ 消息「${previewContent(record.content)}」在上次中断后滞留过久，未自动执行，请重新发送。`,
+              },
+              record.threadId ? { replyInThread: true as const } : undefined,
+            )
+            .catch((err) => log.fail('inbound', err, { step: 'recovery-notice' }));
+        }
+      } catch (err) {
+        log.fail('inbound', err, { step: 'startup-recovery' });
+      }
+    })();
+  }
+
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
 
@@ -307,6 +360,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessionCatalog,
           workspaces,
           thinkingHistory,
+          inboundJournal,
           activeRuns,
           pending,
           msg,
@@ -329,6 +383,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessionCatalog,
           workspaces,
           thinkingHistory,
+          inboundJournal,
           activeRuns,
           agent,
           processPool: pool,
@@ -505,6 +560,7 @@ interface IntakeDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   thinkingHistory?: ThinkingHistoryStore;
+  inboundJournal?: InboundJournal;
   activeRuns: ActiveRuns;
   pending: PendingQueue;
   msg: NormalizedMessage;
@@ -522,6 +578,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     sessionCatalog,
     workspaces,
     thinkingHistory,
+    inboundJournal,
     activeRuns,
     pending,
     msg,
@@ -605,6 +662,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     sessions,
     workspaces,
     thinkingHistory,
+    inboundJournal,
     agent,
     activeRuns,
     sessionCatalog,
@@ -626,8 +684,53 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  // OPT-04: journal the accepted message before it enters the in-memory
+  // queue, so a crash/restart cannot silently drop it. Commands are not
+  // journaled — they are not agent dispatches.
+  if (inboundJournal) {
+    const result = await inboundJournal
+      .recordAccepted({
+        messageId: msg.messageId,
+        scope,
+        chatId: msg.chatId,
+        senderId: msg.senderId,
+        content: msg.content,
+        acceptedAt: msg.createTime || Date.now(),
+        ...(msg.threadId ? { threadId: msg.threadId } : {}),
+        ...(msg.chatType === 'p2p' ? { chatType: 'p2p' as const } : { chatType: 'group' as const }),
+      })
+      .catch(() => 'failed' as const);
+    if (result === 'failed') {
+      log.warn('inbound', 'accept-not-durable', { scope, messageId: msg.messageId });
+    }
+  }
+
   const size = pending.push(scope, routedMessage);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+}
+
+/** Rebuild a replayable message from a journal record (OPT-04 recovery). */
+function recoveryMessage(record: InboundRecord): NormalizedMessage {
+  return {
+    messageId: record.messageId,
+    chatId: record.chatId,
+    chatType: record.chatType ?? 'group',
+    ...(record.threadId ? { threadId: record.threadId } : {}),
+    senderId: record.senderId,
+    senderName: undefined,
+    content: record.content,
+    rawContentType: 'text',
+    resources: [],
+    mentions: [],
+    mentionAll: false,
+    mentionedBot: true,
+    createTime: record.acceptedAt,
+  } as unknown as NormalizedMessage;
+}
+
+function previewContent(content: string): string {
+  const compact = content.replace(/\s+/g, ' ').trim();
+  return compact.length > 40 ? `${compact.slice(0, 40)}…` : compact;
 }
 
 interface RunBatchDeps {
@@ -637,6 +740,7 @@ interface RunBatchDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   thinkingHistory?: ThinkingHistoryStore;
+  inboundJournal?: InboundJournal;
   media: MediaCache;
   batch: NormalizedMessage[];
   controls: Controls;
@@ -654,6 +758,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     sessionCatalog,
     workspaces,
     thinkingHistory,
+    inboundJournal,
     media,
     batch,
     controls,
@@ -778,11 +883,28 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       source: 'im',
       code: flow.rejectReason.code,
     });
+    // A rejection is final for these messages — journal them settled so a
+    // restart does not replay them into the same rejection.
+    await inboundJournal
+      ?.markRejected(
+        scope,
+        batch.map((m) => m.messageId),
+      )
+      .catch(() => undefined);
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
     return;
   }
 
   const { execution, cwdRealpath: cwd } = flow;
+  // OPT-04 claim: the run is about to spawn for this batch — record it so a
+  // crash between spawn and completion classifies as uncertain, not rerun.
+  await inboundJournal
+    ?.markClaimed(
+      scope,
+      batch.map((m) => m.messageId),
+      execution.runId,
+    )
+    .catch(() => undefined);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -832,6 +954,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       const mins = Math.max(1, Math.round(elapsedMs / 60_000));
       const toolCount = state.blocks.filter((b) => b.kind === 'tool').length;
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
+      // OPT-04: the run reached a known terminal state — journal it so a
+      // restart never classifies this batch as uncertain.
+      void inboundJournal
+        ?.markTerminal(scope, execution.runId, state.terminal)
+        .catch(() => undefined);
       const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated });
       // Persist the run's thinking before advertising the /thinking entry —
       // a failed save must not produce a dead hint (OPT-01B).

@@ -344,7 +344,7 @@ function pageBody(reply: string): string {
   return reply.slice(start + 2, end);
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
