@@ -158,3 +158,65 @@ describe('agentKindFromString', () => {
     expect(agentKindFromString(undefined)).toBeUndefined();
   });
 });
+
+// ─── OPT-05: interaction capability matrix ──────────────────────────────────
+
+import type { InteractionCapabilities } from '../../../src/agent/capability';
+
+describe('OPT-05: interaction capability matrix', () => {
+  it('declares thinking events only for stream-json backends (claude, codebuddy)', () => {
+    expect(capabilityForAgentKind('claude', profile()).interactions.thinkingEvents).toBe(true);
+    expect(capabilityForAgentKind('codebuddy', profile()).interactions.thinkingEvents).toBe(true);
+    // Codex JSONL translator maps no reasoning items (protocol evidence:
+    // src/agent/codex/jsonl.ts emits text/final_text/tool/usage only).
+    expect(capabilityForAgentKind('codex', profile()).interactions.thinkingEvents).toBe(false);
+  });
+
+  it('declares incremental text and usage events for all three backends', () => {
+    for (const kind of ['claude', 'codex', 'codebuddy'] as const) {
+      const cap = capabilityForAgentKind(kind, profile());
+      expect(cap.interactions.incrementalText).toBe(true);
+      expect(cap.interactions.usageEvents).toBe(true);
+    }
+  });
+
+  it('declares no structured input/approval/steer channels for any backend yet', () => {
+    // The bridge must never render interaction controls a backend cannot
+    // honor. Until a protocol is verified end-to-end, these stay false.
+    for (const kind of ['claude', 'codex', 'codebuddy'] as const) {
+      const cap = capabilityForAgentKind(kind, profile());
+      expect(cap.interactions.inputRequest).toBe(false);
+      expect(cap.interactions.toolApproval).toBe(false);
+      expect(cap.interactions.taskList).toBe(false);
+      expect(cap.interactions.steer).toBe(false);
+    }
+  });
+
+  it('native history matches supportsNativeHistory', () => {
+    expect(capabilityForAgentKind('claude', profile()).interactions.nativeHistory).toBe(true);
+    expect(capabilityForAgentKind('codex', profile()).interactions.nativeHistory).toBe(false);
+    expect(capabilityForAgentKind('codebuddy', profile()).interactions.nativeHistory).toBe(true);
+  });
+
+  it('the matrix is exposed through capabilityForAgentKind', () => {
+    const cap = capabilityForAgentKind('codebuddy', profile());
+    const keys = Object.keys(cap.interactions) as Array<keyof InteractionCapabilities>;
+    expect(keys.sort()).toEqual([
+      'incrementalText',
+      'inputRequest',
+      'nativeHistory',
+      'steer',
+      'taskList',
+      'thinkingEvents',
+      'toolApproval',
+      'usageEvents',
+    ]);
+  });
+});
+
+function profile() {
+  return createDefaultProfileConfig({
+    agentKind: 'claude',
+    accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
+  });
+}

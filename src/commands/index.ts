@@ -915,6 +915,13 @@ async function handleThinking(args: string, ctx: CommandContext): Promise<void> 
     await reply(ctx, '🧠 思考记录在此实例不可用。');
     return;
   }
+  // OPT-05 capability gate: a backend that never emits thinking events can't
+  // have records — say that instead of a generic "none yet".
+  const capability = capabilityForAgentKind(ctx.controls.profileConfig.agentKind, ctx.controls.profileConfig);
+  if (!capability.interactions.thinkingEvents && store.list(ctx.scope).length === 0) {
+    await reply(ctx, `🧠 当前 agent（${ctx.agent.displayName}）不产生思考事件，没有思考记录可查询。`);
+    return;
+  }
   const parts = args.trim().split(/\s+/).filter(Boolean);
   let ref: string | undefined;
   let page = 1;
