@@ -2,6 +2,8 @@ import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { summarizeToolCalls } from './tool-summary';
 
 const REASONING_MAX = 1500;
+const REASONING_HIDDEN_NOTICE = '_（显示最近思考，前文已隐藏）_';
+const CODE_FENCE = '```';
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
@@ -74,8 +76,58 @@ function reasoningPanel(content: string, active: boolean): object {
     title,
     expanded: active,
     border: 'grey',
-    body: truncate(content, REASONING_MAX),
+    body: reasoningWindow(content),
   });
+}
+
+/**
+ * Tail display window for the reasoning panel (OPT-01A). Thinking keeps
+ * accumulating in RunState; once it exceeds `REASONING_MAX`, the panel shows
+ * the most recent content behind an explicit notice instead of freezing on
+ * the first 1500 code units. The original state is never modified here.
+ *
+ * Window assembly is bounded: notice + optional fence repair + tail all fit
+ * inside `REASONING_MAX`. The cut is Unicode-safe (no split surrogate pairs,
+ * no orphaned combining marks) and snaps forward to a line boundary when one
+ * exists. A cut inside a fenced code block reopens the fence (fence-line
+ * parity heuristic) so the panel stays renderable.
+ */
+function reasoningWindow(content: string): string {
+  if (content.length <= REASONING_MAX) return content;
+  const notice = `${REASONING_HIDDEN_NOTICE}\n`;
+  const budget = REASONING_MAX - notice.length - (CODE_FENCE.length + 1);
+  let start = content.length - budget;
+  if (isLowSurrogate(content.charCodeAt(start))) start -= 1;
+  while (start > 0 && isCombiningMark(content.codePointAt(start)!)) start -= 1;
+  const nl = content.indexOf('\n', start);
+  const lineStart = nl === -1 ? start : nl + 1;
+  // Snapping must never consume the whole window (content ending in "\n").
+  if (lineStart < content.length) start = lineStart;
+  let tail = content.slice(start);
+  if (countFenceLines(tail) % 2 === 1) {
+    tail = `${CODE_FENCE}\n${tail}`;
+  }
+  return `${notice}${tail}`;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+function isCombiningMark(cp: number): boolean {
+  return (
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    cp === 0x200d ||
+    (cp >= 0xfe00 && cp <= 0xfe0f)
+  );
+}
+
+function countFenceLines(s: string): number {
+  let n = 0;
+  for (const line of s.split('\n')) {
+    if (line.trimStart().startsWith(CODE_FENCE)) n += 1;
+  }
+  return n;
 }
 
 /**
@@ -193,8 +245,4 @@ function summaryText(state: RunState): string {
   if (state.footer === 'streaming') return '正在输出';
   if (state.footer === 'closing') return '正在收尾';
   return '思考中';
-}
-
-function truncate(s: string, max: number): string {
-  return s.length > max ? `${s.slice(0, max)}…` : s;
 }
