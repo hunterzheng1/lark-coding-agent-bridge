@@ -1,6 +1,6 @@
 # OPT-01：最新思考与完整记录入口
 
-状态：未实施。产品方向已接受。优先级 P0。分片 01A 修复窗口，01B 完成记录访问。
+状态：01A 已完成（commit `6381ca7`），01B 已完成（commit `fedce94`），本地验证通过、用户现场未验证。产品方向已接受。优先级 P0。分片 01A 修复窗口，01B 完成记录访问。实施记录见文末。
 
 ## 问题与证据
 
@@ -74,3 +74,28 @@ CodeBuddy 在 `src/agent/codebuddy/adapter.ts` 复用 `src/agent/claude/stream-j
 ## 完成证据
 
 提交回归测试的失败/通过结果、持久化与权限测试、用户可见样例、所选保留/查询语义。部署和用户现场验证另按授权进行。
+
+## 实施记录（2026-09-17，基线 e387662）
+
+### 所选语义（相对候选接口的取舍）
+
+- **01A**：窗口仍为 1,500 UTF-16 code unit（`REASONING_MAX`），但改为**尾部窗口**；超限时正文首行显示「_（显示最近思考，前文已隐藏）_」。提示文字与可选的代码围栏修复计入预算，总正文不超过 1,500。裁切按 surrogate pair / 组合标记（U+0300–036F、ZWJ、变体选择符）回退，并尽量对齐下一行首；按围栏行奇偶启发式在裁切落入代码块内时补开 ``` 围栏。原始 `reasoning.content` 不被修改；活动/完成面板同一窗口。
+- **01B 存储**：`src/session/thinking-history.ts` 的 `ThinkingHistoryStore`。每终态运行保存一条记录（含无思考运行，`hasThinking=false`），文件位于 `<profileDir>/thinking/`，原子写入 0600，每 scope 一个 JSON。默认上限：每 scope 20 条、单条 100,000 字符、7 天过期（保存/读取时惰性清理）；超限保留头部并显式 `partial` + `originalChars`。记录内容等于桥接器收到的 thinking 增量拼接，不包含任何补写。
+- **01B 查询**：`/thinking`（最近一次运行第 1 页）、`/thinking <页码>`、`/thinking <runId|前缀> [页]`。每页 2,800 字符，页边界共享并避开 surrogate 切分，所有页拼接等于存储内容。前缀 < 2 字符或命中多条时返回不唯一候选；查不到、过期、跨 Scope 均返回「未找到」（查找仅限当前 scope 文件，runId 不是授权凭证）。最新运行无思考时明确说明并列出更早运行的短 runId，不回落旧内容。查询只读，不触发运行。
+- **入口文案**：保存成功且确有思考时，终态通知追加 `· /thinking <前8位> 查看思考记录`；保存失败或无思考不加提示。不做终态卡片按钮：现有 `verifyBridgeToken` 要求 scope 上存在 active run，终态卡按钮会被回调校验拒绝；改为按钮需扩大回调鉴权语义（改变权限边界），留待后续任务明确取舍。
+- **`/new` 与重启**：记录按 scope 保留，`/new` 不清除（历史语义）；重启后仍可查询。保留期/容量为代码内默认值，尚未做成配置项。
+
+### 验证证据
+
+- 红灯：`tests/unit/card/run-reasoning-window.test.ts` 在基线行为下 9/12 失败（含 03-verification 的最小红灯样例）；实现后 12/12 通过。既有快照 23 项未变（旧样例均未超限）。
+- 01B 红灯：新测试文件在实现前全部无法加载/失败；实现后：
+  - `tests/unit/session/thinking-history.test.ts` 14 项（保存/前缀/歧义/隔离/容量/过期/部分记录/重载/损坏容忍/保存失败/替换/Unicode 往返）。
+  - `tests/integration/commands/thinking-command.test.ts` 9 项（分页拼接、无思考不泄露、越界页码、partial 标注、Scope 隔离、无 store 降级等）。
+  - `tests/integration/bot/thinking-history.test.ts` 3 项端到端（startChannel→thinking 事件→终态保存→通知提示→分页重建全等；无思考不加提示；保存失败不阻断不提示）。
+- 局部套件：card + session + 命令 + 端到端 15 文件 133 项通过；`pnpm typecheck` 通过；`pnpm test` 全量 101 文件中 100 通过，仅 `tests/unit/observability/logger.test.ts` 2 项失败——已用 `git stash` 在无改动的 e387662 基线上复现同样失败，属既有问题（telemetry tags 断言），与 OPT-01 无关。
+
+### 剩余事项
+
+- 保留期/容量未做成用户可配置项（默认值已文档化）。
+- 终态卡片无 `/thinking` 按钮（回调鉴权语义限制，见上）。
+- 用户现场（真实 CodeBuddy 卡片、真实手机端）未验证；本机运行中的 0.3.17 服务未重启加载新代码。
