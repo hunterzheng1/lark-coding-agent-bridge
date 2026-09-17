@@ -1,6 +1,6 @@
 # OPT-05：结构化交互与能力声明
 
-状态：建议，未实施。优先级 P2。
+状态：能力矩阵分片已实施（commit `1e4a8a3`）；纵向交互闭环未实施（见文末后续步骤）。优先级 P2。
 
 ## 目标
 
@@ -46,3 +46,31 @@
 ## 边界
 
 本任务不是授权改成自动批准全部工具。权限默认值、审批粒度及后台执行范围是独立产品决策。
+
+## 实施记录（2026-09-17，基线 ee12588）
+
+### 已实施：能力矩阵与协议证据（规格第一分片）
+
+`src/agent/capability.ts` 的 `AgentCapability` 新增 `interactions: InteractionCapabilities`，契约测试锁定取值：
+
+| 维度 | claude | codebuddy | codex | 协议证据 |
+|---|---|---|---|---|
+| thinkingEvents | ✓ | ✓ | ✗ | claude/codebuddy 走 `src/agent/claude/stream-json.ts`（`block.type==='thinking'` 映射）；codex `src/agent/codex/jsonl.ts` 只映射 agent_message/命令/token_count，无 reasoning item |
+| incrementalText | ✓ | ✓ | ✓ | claude stream-json `text` delta；codex `agent_message` 增量与 `final_text` 分流 |
+| usageEvents | ✓ | ✓ | ✓ | 两侧 translator 均映射 token usage |
+| nativeHistory | ✓ | ✓ | ✗ | 与既有 `supportsNativeHistory` 一致（codex 按 threadId 续聊，无历史 provider） |
+| inputRequest | ✗ | ✗ | ✗ | 三个后端在桥接器使用的 `-p`/exec 模式下均无已核验的结构化输入请求通道 |
+| toolApproval | ✗ | ✗ | ✗ | 同上；未核验前不得渲染审批按钮，也不得用 prompt 模拟审批 |
+| taskList | ✗ | ✗ | ✗ | 无结构化 plan/task 事件映射 |
+| steer | ✗ | ✗ | ✗ | 运行中补充消息维持既有"下一轮"排队语义 |
+
+已接线的唯一消费点：`/thinking` 在 `thinkingEvents=false` 的后端上明确答复"该 agent 不产生思考事件"，替代笼统的"暂无记录"。矩阵的契约测试（5 项）防止后续未经声明就开放交互控制。
+
+### 未实施：纵向交互闭环（规格第二分片）
+
+三个后端在当前调用模式下都没有现成的双向交互协议（Claude 的审批通道需要 `--permission-prompt-tool` + MCP server 链路；Codex proto 的审批事件未被本 fork 的 exec 封装暴露）。按规格"先核验协议，不通过 prompt 模拟审批"，本切片不猜测协议。后续步骤（按顺序）：
+
+1. 对 `claude --help` / `codex --help` 与对应版本文档核验审批/输入请求的实际调用方式，并记录到本文件。
+2. 选 Claude 一个交互类型（建议 toolApproval）做端到端：MCP prompt-tool → bridge 卡片按钮（复用 `callback-auth` 签名 + 新的终态卡片回调校验语义，见 OPT-01 遗留）→ `control_response` 回写 → 后端确认。
+3. 契约测试加入矩阵：该后端该维度翻 true，其他后端保持 false。
+4. `requestId`/过期/一次性点击/跨 scope 拒绝按"交互契约"一节逐条验收。
