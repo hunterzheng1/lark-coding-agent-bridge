@@ -286,11 +286,16 @@ export function buildCompletionNotice(opts: {
   mins: number;
   toolCount: number;
   truncated: boolean;
+  failedTools?: number;
 }): string {
   // `/last` alone shows a tail view; only `/last full` pages through the
   // complete stored output losslessly — the hint must say so.
   const truncPart = opts.truncated ? ' · 输出较长，回复 /last full 查看完整' : '';
-  return `✅ 完成 · 耗时 ${opts.mins}m · ${opts.toolCount} 工具${truncPart} · /doctor 查详情`;
+  // OPT-06 completion evidence: a green "done" must not hide failed tools —
+  // the count comes from structured tool_result events, not model claims.
+  const failedPart =
+    opts.failedTools && opts.failedTools > 0 ? ` · ${opts.failedTools} 个工具失败` : '';
+  return `✅ 完成 · 耗时 ${opts.mins}m · ${opts.toolCount} 工具${failedPart}${truncPart} · /doctor 查详情`;
 }
 
 /**
@@ -304,7 +309,7 @@ export function buildCompletionNotice(opts: {
  */
 export function buildTerminalNotice(
   state: RunState,
-  opts: { mins: number; toolCount: number; truncated: boolean },
+  opts: { mins: number; toolCount: number; truncated: boolean; failedTools?: number },
 ): string {
   switch (state.terminal) {
     case 'error':

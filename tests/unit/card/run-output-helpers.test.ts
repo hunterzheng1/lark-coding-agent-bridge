@@ -76,6 +76,25 @@ describe('buildCompletionNotice', () => {
     const out = buildCompletionNotice({ mins: 8, toolCount: 18, truncated: true });
     expect(out).toContain('输出较长，回复 /last full 查看完整');
   });
+
+  // ─── OPT-06: completion evidence ─────────────────────────────────────────
+
+  it('UT-016: failed tools are surfaced in the completion notice, not hidden behind ✅', () => {
+    const out = buildCompletionNotice({ mins: 8, toolCount: 18, truncated: false, failedTools: 3 });
+    expect(out).toContain('3 个工具失败');
+  });
+
+  it('UT-017: no failures → notice unchanged (no failure mention)', () => {
+    const out = buildCompletionNotice({ mins: 8, toolCount: 18, truncated: false, failedTools: 0 });
+    expect(out).not.toContain('失败');
+  });
+
+  it('UT-018: done with failed tools keeps both facts in the terminal notice', () => {
+    const s: RunState = { ...initialState, terminal: 'done' };
+    const out = buildTerminalNotice(s, { mins: 5, toolCount: 4, truncated: false, failedTools: 2 });
+    expect(out).toContain('✅ 完成');
+    expect(out).toContain('2 个工具失败');
+  });
 });
 
 describe('buildTerminalNotice', () => {

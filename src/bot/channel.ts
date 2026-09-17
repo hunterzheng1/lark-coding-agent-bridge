@@ -953,13 +953,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     onTerminal: (state, elapsedMs, fullText, truncated) => {
       const mins = Math.max(1, Math.round(elapsedMs / 60_000));
       const toolCount = state.blocks.filter((b) => b.kind === 'tool').length;
+      // OPT-06: failure evidence from structured tool_result events — a green
+      // completion notice must not hide failed tool calls.
+      const failedTools = state.blocks.filter(
+        (b) => b.kind === 'tool' && b.tool.status === 'error',
+      ).length;
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
       // OPT-04: the run reached a known terminal state — journal it so a
       // restart never classifies this batch as uncertain.
       void inboundJournal
         ?.markTerminal(scope, execution.runId, state.terminal)
         .catch(() => undefined);
-      const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated });
+      const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated, failedTools });
       // Persist the run's thinking before advertising the /thinking entry —
       // a failed save must not produce a dead hint (OPT-01B).
       void (async () => {
