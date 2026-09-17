@@ -67,6 +67,8 @@ import {
   type ListCodexThreadHistoryOptions,
 } from '../session/codex-history';
 import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
+import type { ThinkingHistoryStore, ThinkingRecord } from '../session/thinking-history';
+import { shortRunId } from '../session/thinking-history';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import type { SessionStore } from '../session/store';
 import { resolveWorkingDirectory } from '../policy/workspace';
@@ -121,6 +123,9 @@ export interface CommandContext {
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
+  /** Per-run thinking records backing /thinking (OPT-01B). Optional so
+   * test harnesses can omit it; /thinking degrades gracefully. */
+  thinkingHistory?: ThinkingHistoryStore;
   sessionCatalogIdentity?: SessionCatalogIdentity;
   workspaces: WorkspaceStore;
   agent: AgentAdapter;
@@ -173,6 +178,7 @@ const handlers: Record<string, Handler> = {
   '/exit': handleExit,
   '/doctor': handleDoctor,
   '/last': handleLast,
+  '/thinking': handleThinking,
   '/reconnect': handleReconnect,
   '/doc': handleDoc,
   '/invite': handleInvite,
@@ -865,6 +871,142 @@ function parseLastN(args: string): number {
   const n = Number.parseInt(trimmed, 10);
   if (!Number.isFinite(n) || n <= 0) return DEFAULT;
   return Math.min(n, 500);
+}
+
+// ─── /thinking (OPT-01B) ────────────────────────────────────────────────────
+
+const THINKING_PAGE_CHARS = 2800;
+
+/**
+ * `/thinking` — latest run's thinking record, page 1.
+ * `/thinking <page>` — page N of the latest run.
+ * `/thinking <runId|prefix> [page]` — an explicit run (old cards keep their
+ * identity). Read-only over persisted records; never triggers a run.
+ */
+async function handleThinking(args: string, ctx: CommandContext): Promise<void> {
+  const store = ctx.thinkingHistory;
+  if (!store) {
+    await reply(ctx, '🧠 思考记录在此实例不可用。');
+    return;
+  }
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+  let ref: string | undefined;
+  let page = 1;
+  if (parts[0]) {
+    if (/^\d+$/.test(parts[0])) {
+      page = Math.max(1, Number.parseInt(parts[0], 10));
+    } else {
+      ref = parts[0];
+      if (parts[1] && /^\d+$/.test(parts[1])) {
+        page = Math.max(1, Number.parseInt(parts[1], 10));
+      }
+    }
+  }
+
+  if (ref) {
+    const lookup = store.get(ctx.scope, ref);
+    if (lookup.kind === 'missing') {
+      await reply(ctx, `未找到该 run 的思考记录（本会话仅保留最近运行，且过期自动清理）。回复 /thinking 查看最新记录。`);
+      return;
+    }
+    if (lookup.kind === 'ambiguous') {
+      await reply(
+        ctx,
+        `runId 前缀不唯一，请用更长前缀。候选：${lookup.candidateIds.map(shortRunId).join('、')}`,
+      );
+      return;
+    }
+    await replyThinkingPage(ctx, lookup.record, page);
+    return;
+  }
+
+  const metas = store.list(ctx.scope);
+  if (metas.length === 0) {
+    await reply(ctx, '🧠 本会话暂无已保存的思考记录。运行结束后会自动保存。');
+    return;
+  }
+  const latest = metas[0]!;
+  const lookup = store.get(ctx.scope, latest.runId);
+  if (lookup.kind !== 'found') {
+    await reply(ctx, '🧠 思考记录读取失败。');
+    return;
+  }
+  if (!lookup.record.hasThinking) {
+    // The latest run had no thinking — say so instead of silently falling
+    // back to an older run's content.
+    const withThinking = metas.filter((m) => m.hasThinking);
+    const olderHint =
+      withThinking.length > 0
+        ? `更早的含思考运行（共 ${withThinking.length} 条）：${withThinking
+            .slice(0, 3)
+            .map((m) => `/thinking ${shortRunId(m.runId)}`)
+            .join('、')}`
+        : '本会话还没有含思考的运行。';
+    await reply(
+      ctx,
+      `🧠 最近一次运行（run ${shortRunId(latest.runId)} · ${terminalText(latest.terminal)}）没有思考内容。\n${olderHint}`,
+    );
+    return;
+  }
+  await replyThinkingPage(ctx, lookup.record, page);
+}
+
+async function replyThinkingPage(
+  ctx: CommandContext,
+  record: ThinkingRecord,
+  page: number,
+): Promise<void> {
+  const totalPages = Math.max(1, Math.ceil(record.content.length / THINKING_PAGE_CHARS));
+  const short = shortRunId(record.runId);
+  if (page > totalPages) {
+    await reply(ctx, `页码超出范围：run ${short} 共 ${totalPages} 页。用法：/thinking ${short} <页码 1-${totalPages}>`);
+    return;
+  }
+  const header =
+    `🧠 思考记录 run ${short} · ${record.agent} · ${terminalText(record.terminal)} · ` +
+    `共 ${record.content.length} 字符 · 第 ${page}/${totalPages} 页`;
+  const partialLine = record.partial
+    ? `\n（部分记录：受容量限制仅保留前 ${record.storedChars} / ${record.originalChars} 字符）`
+    : '';
+  const footer = page < totalPages ? `\n\n📄 下一页：/thinking ${short} ${page + 1}` : '';
+  await reply(ctx, `${header}${partialLine}\n\n${thinkingPageSlice(record.content, page, totalPages)}${footer}`);
+}
+
+/**
+ * Page boundaries step every THINKING_PAGE_CHARS chars, backing off over a
+ * surrogate pair so no page splits one. Boundaries are shared by adjacent
+ * pages, so concatenating all pages reproduces the stored content exactly.
+ */
+function thinkingPageSlice(content: string, page: number, totalPages: number): string {
+  const start = thinkingPageBoundary(content, page - 1);
+  if (page >= totalPages) return content.slice(start);
+  const end = thinkingPageBoundary(content, page);
+  return content.slice(start, end);
+}
+
+function thinkingPageBoundary(content: string, pageIndex: number): number {
+  let cut = pageIndex * THINKING_PAGE_CHARS;
+  while (cut > 0 && cut < content.length) {
+    const prev = content.charCodeAt(cut - 1);
+    if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;
+    else break;
+  }
+  return cut;
+}
+
+function terminalText(terminal: string): string {
+  switch (terminal) {
+    case 'done':
+      return '已完成';
+    case 'error':
+      return '失败';
+    case 'interrupted':
+      return '已中断';
+    case 'idle_timeout':
+      return '已超时';
+    default:
+      return terminal;
+  }
 }
 
 function formatOwnerState(ctx: CommandContext): string {

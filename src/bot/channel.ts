@@ -58,6 +58,8 @@ import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
+import type { ThinkingHistoryStore } from '../session/thinking-history';
+import { appendThinkingHint } from '../session/thinking-history';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
@@ -176,12 +178,13 @@ export interface StartChannelDeps {
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
+  thinkingHistory?: ThinkingHistoryStore;
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
-  const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
+  const { cfg, agent, sessions, sessionCatalog, workspaces, thinkingHistory, controls } = deps;
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -272,6 +275,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessions,
           sessionCatalog,
           workspaces,
+          thinkingHistory,
           media,
           batch,
           controls,
@@ -301,6 +305,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessions,
           sessionCatalog,
           workspaces,
+          thinkingHistory,
           activeRuns,
           pending,
           msg,
@@ -322,6 +327,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessions,
           sessionCatalog,
           workspaces,
+          thinkingHistory,
           activeRuns,
           agent,
           processPool: pool,
@@ -497,6 +503,7 @@ interface IntakeDeps {
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
+  thinkingHistory?: ThinkingHistoryStore;
   activeRuns: ActiveRuns;
   pending: PendingQueue;
   msg: NormalizedMessage;
@@ -513,6 +520,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     sessions,
     sessionCatalog,
     workspaces,
+    thinkingHistory,
     activeRuns,
     pending,
     msg,
@@ -595,6 +603,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     chatMode,
     sessions,
     workspaces,
+    thinkingHistory,
     agent,
     activeRuns,
     sessionCatalog,
@@ -626,6 +635,7 @@ interface RunBatchDeps {
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
+  thinkingHistory?: ThinkingHistoryStore;
   media: MediaCache;
   batch: NormalizedMessage[];
   controls: Controls;
@@ -642,6 +652,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     sessions,
     sessionCatalog,
     workspaces,
+    thinkingHistory,
     media,
     batch,
     controls,
@@ -820,13 +831,35 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       const mins = Math.max(1, Math.round(elapsedMs / 60_000));
       const toolCount = state.blocks.filter((b) => b.kind === 'tool').length;
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
-      void channel
-        .send(
-          chatId,
-          { markdown: buildTerminalNotice(state, { mins, toolCount, truncated }) },
-          sendOpts,
-        )
-        .catch((err) => log.fail('stream', err, { step: 'completion' }));
+      const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated });
+      // Persist the run's thinking before advertising the /thinking entry —
+      // a failed save must not produce a dead hint (OPT-01B).
+      void (async () => {
+        let notice = baseNotice;
+        if (thinkingHistory) {
+          const endedAt = Date.now();
+          const saved = await thinkingHistory
+            .save({
+              scope,
+              runId: execution.runId,
+              agent: controls.profileConfig.agentKind,
+              startedAt: endedAt - elapsedMs,
+              endedAt,
+              terminal: state.terminal,
+              content: state.reasoning.content,
+            })
+            .catch(() => false);
+          if (!saved) {
+            log.warn('thinking', 'save-failed', { scope, runId: execution.runId });
+          }
+          notice = appendThinkingHint(notice, {
+            saved,
+            hasThinking: state.reasoning.content.length > 0,
+            runId: execution.runId,
+          });
+        }
+        await channel.send(chatId, { markdown: notice }, sendOpts);
+      })().catch((err) => log.fail('stream', err, { step: 'completion' }));
     },
   };
 

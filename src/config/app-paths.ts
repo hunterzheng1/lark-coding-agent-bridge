@@ -24,6 +24,8 @@ export interface AppPaths {
   larkCliTargetConfigFile: string;
   mediaDir: string;
   logsDir: string;
+  /** Per-run thinking records queried via /thinking (OPT-01B). */
+  thinkingDir: string;
   registryDir: string;
   userRegistryFile: string;
   userLockDir: string;
@@ -58,6 +60,7 @@ export function resolveAppPaths(opts: ResolveAppPathsOptions = {}): AppPaths {
     larkCliTargetConfigFile: join(profileDir, 'lark-cli', 'lark-channel', 'config.json'),
     mediaDir: join(profileDir, 'media'),
     logsDir: join(profileDir, 'logs'),
+    thinkingDir: join(profileDir, 'thinking'),
     registryDir,
     userRegistryFile: join(registryDir, 'processes.json'),
     userLockDir,
