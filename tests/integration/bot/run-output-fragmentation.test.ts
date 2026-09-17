@@ -1,8 +1,10 @@
 import type { NormalizedMessage } from '@larksuite/channel';
+import { Buffer } from 'node:buffer';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
+import { CARD_PAYLOAD_BUDGET_BYTES } from '../../../src/card/run-renderer.js';
 import type { AgentEvent } from '../../../src/agent/types';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
@@ -232,6 +234,33 @@ describe('run output fragmentation — card mode', () => {
     );
     expect(finalCard?.content).toHaveProperty('card');
     expect(h.sessions.getLastRunOutput('oc_dm')).toBe(FULL_TEXT);
+  });
+
+  it('OPT-03: every delivered card stays within the serialized byte budget', async () => {
+    // Escape-heavy content inflates wire size beyond what char windows bound.
+    const escapeHeavy = '\u001b'.repeat(4500);
+    const h = await createHarness('card', {
+      narration: escapeHeavy,
+      finalReply: 'final answer',
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_card_budget', 'do the thing'));
+    await waitFor(() =>
+      h.channel.sent.some((sent) => JSON.stringify(sent.content).includes('final answer')),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const cards = h.channel.cardkitRequests
+      .map((r) => r.params as { cardJson?: unknown })
+      .filter((p) => p.cardJson !== undefined)
+      .map((p) => p.cardJson as object);
+    expect(cards.length).toBeGreaterThan(0);
+    for (const card of cards) {
+      expect(Buffer.byteLength(JSON.stringify(card), 'utf8')).toBeLessThanOrEqual(
+        CARD_PAYLOAD_BUDGET_BYTES,
+      );
+    }
   });
 
   it('adds a /last hint when the reserved final card is truncated', async () => {

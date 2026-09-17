@@ -849,19 +849,39 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleLast(args: string, ctx: CommandContext): Promise<void> {
-  const n = parseLastN(args);
   const text = ctx.sessions.getLastRunOutput(ctx.scope);
   if (!text || !text.trim()) {
     await reply(ctx, '本 session 暂无上一条 run 的结果。');
     return;
   }
+  const trimmed = args.trim();
+  // `/last full [页]` — lossless pagination over the complete stored output.
+  if (trimmed === 'full' || /^full\s+\d+$/.test(trimmed)) {
+    const pagePart = trimmed.slice('full'.length).trim();
+    const page = pagePart ? Math.max(1, Number.parseInt(pagePart, 10)) : 1;
+    await replyLastFullPage(ctx, text, page);
+    return;
+  }
+  // Legacy view: tail N lines (numbers keep their line-count meaning).
+  const n = parseLastN(trimmed);
   const lines = text.split('\n');
   const shown = Math.min(n, lines.length);
   const tail = lines.slice(-n).join('\n');
   const MAX_CHARS = 3000;
   const capped = tail.length > MAX_CHARS ? tail.slice(-MAX_CHARS) : tail;
-  const truncated = tail.length > MAX_CHARS ? '（字符截断）' : '';
+  const truncated = tail.length > MAX_CHARS ? '（字符截断，/last full 查看完整分页）' : '';
   await reply(ctx, `上一条 run 最后 ${shown} 行${truncated}：\n\n${capped}`);
+}
+
+async function replyLastFullPage(ctx: CommandContext, text: string, page: number): Promise<void> {
+  const totalPages = Math.max(1, Math.ceil(text.length / THINKING_PAGE_CHARS));
+  if (page > totalPages) {
+    await reply(ctx, `页码超出范围：共 ${totalPages} 页。用法：/last full <页码 1-${totalPages}>`);
+    return;
+  }
+  const header = `上一条 run 完整输出 · 共 ${text.length} 字符 · 第 ${page}/${totalPages} 页`;
+  const footer = page < totalPages ? `\n\n📄 下一页：/last full ${page + 1}` : '';
+  await reply(ctx, `${header}\n\n${pageSlice(text, page, totalPages, THINKING_PAGE_CHARS)}${footer}`);
 }
 
 function parseLastN(args: string): number {
@@ -969,23 +989,24 @@ async function replyThinkingPage(
     ? `\n（部分记录：受容量限制仅保留前 ${record.storedChars} / ${record.originalChars} 字符）`
     : '';
   const footer = page < totalPages ? `\n\n📄 下一页：/thinking ${short} ${page + 1}` : '';
-  await reply(ctx, `${header}${partialLine}\n\n${thinkingPageSlice(record.content, page, totalPages)}${footer}`);
+  await reply(ctx, `${header}${partialLine}\n\n${pageSlice(record.content, page, totalPages, THINKING_PAGE_CHARS)}${footer}`);
 }
 
 /**
- * Page boundaries step every THINKING_PAGE_CHARS chars, backing off over a
- * surrogate pair so no page splits one. Boundaries are shared by adjacent
- * pages, so concatenating all pages reproduces the stored content exactly.
+ * Page boundaries step every `pageChars` chars, backing off over a surrogate
+ * pair so no page splits one. Boundaries are shared by adjacent pages, so
+ * concatenating all pages reproduces the content exactly (OPT-03 contract:
+ * lossless segmented delivery, identical across renders).
  */
-function thinkingPageSlice(content: string, page: number, totalPages: number): string {
-  const start = thinkingPageBoundary(content, page - 1);
+function pageSlice(content: string, page: number, totalPages: number, pageChars: number): string {
+  const start = pageBoundary(content, page - 1, pageChars);
   if (page >= totalPages) return content.slice(start);
-  const end = thinkingPageBoundary(content, page);
+  const end = pageBoundary(content, page, pageChars);
   return content.slice(start, end);
 }
 
-function thinkingPageBoundary(content: string, pageIndex: number): number {
-  let cut = pageIndex * THINKING_PAGE_CHARS;
+function pageBoundary(content: string, pageIndex: number, pageChars: number): number {
+  let cut = pageIndex * pageChars;
   while (cut > 0 && cut < content.length) {
     const prev = content.charCodeAt(cut - 1);
     if (prev >= 0xd800 && prev <= 0xdbff) cut -= 1;

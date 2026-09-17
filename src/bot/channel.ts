@@ -17,7 +17,7 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
-import { renderCard, type RunCardProgress } from '../card/run-renderer';
+import { renderCardBounded, type RunCardProgress } from '../card/run-renderer';
 import { ResilientCardUpdater } from '../card/resilient-updater';
 import { SnapshotScheduler } from '../card/snapshot-scheduler';
 import {
@@ -910,7 +910,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         ...(sendOpts.replyInThread ? { replyInThread: true as const } : {}),
       };
       const renderProgressCard = (state: RunState, progress: RunCardProgress): object =>
-        renderCard(filterForPrefs(state), { ...cardRenderOptions, progress });
+        renderCardBounded(filterForPrefs(state), { ...cardRenderOptions, progress });
       const cardUpdater = new ResilientCardUpdater({
         sendSuccessor: async (card) => {
           const prev = activeSession;
@@ -1193,7 +1193,7 @@ async function sendReservedFinalReply(input: {
   if (input.replyMode === 'card') {
     await input.channel.send(
       input.chatId,
-      { card: renderCard(windowState(finalState, WINDOW_OPTS), input.cardRenderOptions) },
+      { card: renderCardBounded(windowState(finalState, WINDOW_OPTS), input.cardRenderOptions) },
       input.sendOpts,
     );
     return;

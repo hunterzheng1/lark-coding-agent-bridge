@@ -287,7 +287,9 @@ export function buildCompletionNotice(opts: {
   toolCount: number;
   truncated: boolean;
 }): string {
-  const truncPart = opts.truncated ? ' · 输出较长，回复 /last 查看完整' : '';
+  // `/last` alone shows a tail view; only `/last full` pages through the
+  // complete stored output losslessly — the hint must say so.
+  const truncPart = opts.truncated ? ' · 输出较长，回复 /last full 查看完整' : '';
   return `✅ 完成 · 耗时 ${opts.mins}m · ${opts.toolCount} 工具${truncPart} · /doctor 查详情`;
 }
 

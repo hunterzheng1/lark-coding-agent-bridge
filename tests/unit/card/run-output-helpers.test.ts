@@ -72,9 +72,9 @@ describe('buildCompletionNotice', () => {
     expect(out).not.toContain('/last');
   });
 
-  it('UT-008: truncated → appends /last recall hint', () => {
+  it('UT-008: truncated → appends /last full recall hint', () => {
     const out = buildCompletionNotice({ mins: 8, toolCount: 18, truncated: true });
-    expect(out).toContain('输出较长，回复 /last 查看完整');
+    expect(out).toContain('输出较长，回复 /last full 查看完整');
   });
 });
 
@@ -119,10 +119,10 @@ describe('buildTerminalNotice', () => {
     expect(out).not.toContain('✅ 完成');
   });
 
-  it('UT-014: done truncated → /last hint (delegates to buildCompletionNotice)', () => {
+  it('UT-014: done truncated → /last full hint (delegates to buildCompletionNotice)', () => {
     const s: RunState = { ...initialState, terminal: 'done' };
     const out = buildTerminalNotice(s, { mins: 5, toolCount: 3, truncated: true });
-    expect(out).toContain('输出较长，回复 /last 查看完整');
+    expect(out).toContain('输出较长，回复 /last full 查看完整');
   });
 
   it('UT-015: idle_timeout without idleTimeoutMinutes → ⏱ 0 分钟 (default ?? 0, consistent with renderText/renderCard)', () => {

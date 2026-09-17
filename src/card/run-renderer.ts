@@ -1,13 +1,32 @@
-import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
+import { Buffer } from 'node:buffer';
+import { windowState, type Block, type FooterStatus, type RunState, type ToolEntry } from './run-state';
 import { summarizeToolCalls } from './tool-summary';
 
 const REASONING_MAX = 1500;
 const REASONING_HIDDEN_NOTICE = '_（显示最近思考，前文已隐藏）_';
 const CODE_FENCE = '```';
 
+/**
+ * Serialized-UTF-8 byte budget for one card payload (OPT-03). Char-count
+ * windows bound content lengths, but JSON escaping and multi-byte scripts can
+ * still inflate the wire size; this budget is checked against the actual
+ * serialized card. Conservative default — not an official Feishu limit; the
+ * exact per-endpoint cap must be verified against Feishu's API docs.
+ */
+export const CARD_PAYLOAD_BUDGET_BYTES = 24_000;
+
+/** Degradation ladder: shrink reasoning first, then body text, per rung. */
+const BUDGET_LADDER: ReadonlyArray<{ reasoningMax: number; textMax: number }> = [
+  { reasoningMax: REASONING_MAX, textMax: 4_000 },
+  { reasoningMax: 600, textMax: 2_000 },
+  { reasoningMax: 240, textMax: 900 },
+  { reasoningMax: 0, textMax: 350 },
+];
+
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
   progress?: RunCardProgress;
+  budgetBytes?: number;
 }
 
 export interface RunCardProgress {
@@ -19,6 +38,36 @@ export interface RunCardProgress {
 }
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
+  return renderCardWithReasoningMax(state, options, REASONING_MAX);
+}
+
+/**
+ * Render within a serialized-byte budget (OPT-03): walk the degradation
+ * ladder (shrink reasoning first, then body text) until the card fits.
+ * Terminal notices, error notes, and the stop control are rendered at every
+ * rung — degradation must never hide failure state. Pure; input untouched.
+ * Falls back to the smallest rung's output if even that exceeds the budget.
+ */
+export function renderCardBounded(state: RunState, options: RunCardRenderOptions = {}): object {
+  const budget = options.budgetBytes ?? CARD_PAYLOAD_BUDGET_BYTES;
+  let last: object | undefined;
+  for (const rung of BUDGET_LADDER) {
+    const windowed = windowState(state, { maxTextChars: rung.textMax });
+    last = renderCardWithReasoningMax(windowed, options, rung.reasoningMax);
+    if (wireBytes(last) <= budget) return last;
+  }
+  return last!;
+}
+
+function wireBytes(card: object): number {
+  return Buffer.byteLength(JSON.stringify(card), 'utf8');
+}
+
+function renderCardWithReasoningMax(
+  state: RunState,
+  options: RunCardRenderOptions,
+  reasoningMax: number,
+): object {
   const elements: object[] = [];
   const allTools = state.blocks
     .filter((block): block is Extract<Block, { kind: 'tool' }> => block.kind === 'tool')
@@ -29,8 +78,8 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     elements.push(progressStatus(options.progress));
   }
 
-  if (state.reasoning.content) {
-    elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));
+  if (state.reasoning.content && reasoningMax > 0) {
+    elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active, reasoningMax));
   }
 
   for (const block of state.blocks) {
@@ -70,13 +119,13 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   };
 }
 
-function reasoningPanel(content: string, active: boolean): object {
+function reasoningPanel(content: string, active: boolean, max: number = REASONING_MAX): object {
   const title = active ? '🧠 **思考中**' : '🧠 **思考完成，点击查看**';
   return collapsiblePanel({
     title,
     expanded: active,
     border: 'grey',
-    body: reasoningWindow(content),
+    body: reasoningWindow(content, max),
   });
 }
 
@@ -92,10 +141,11 @@ function reasoningPanel(content: string, active: boolean): object {
  * exists. A cut inside a fenced code block reopens the fence (fence-line
  * parity heuristic) so the panel stays renderable.
  */
-function reasoningWindow(content: string): string {
-  if (content.length <= REASONING_MAX) return content;
+function reasoningWindow(content: string, max: number = REASONING_MAX): string {
+  if (content.length <= max) return content;
   const notice = `${REASONING_HIDDEN_NOTICE}\n`;
-  const budget = REASONING_MAX - notice.length - (CODE_FENCE.length + 1);
+  const budget = max - notice.length - (CODE_FENCE.length + 1);
+  if (budget <= 0) return '';
   let start = content.length - budget;
   if (isLowSurrogate(content.charCodeAt(start))) start -= 1;
   while (start > 0 && isCombiningMark(content.codePointAt(start)!)) start -= 1;
