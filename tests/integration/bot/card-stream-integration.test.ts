@@ -135,6 +135,115 @@ describe('card-stream integration — D + N scenarios (processAgentStream level)
   });
 });
 
+// ─── OPT-02: delivery scheduling inside processAgentStream ─────────────────
+
+interface Deferred {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error('timed out');
+}
+
+describe('OPT-02: slow API + event burst coalescing', () => {
+  it('keeps draining events while a flush is in flight; delivers the latest state once', async () => {
+    const gate = deferred();
+    const flushCalls: string[] = [];
+    const flush = async (state: { blocks: Array<{ kind: string; content?: string }> }) => {
+      const text = state.blocks.map((b) => b.content ?? '').join('');
+      flushCalls.push(text);
+      if (flushCalls.length === 1) await gate.promise;
+    };
+    const evts: AgentEvent[] = [
+      { type: 'text', delta: 'a' } as AgentEvent,
+      { type: 'text', delta: 'b' } as AgentEvent,
+      { type: 'text', delta: 'c' } as AgentEvent,
+      { type: 'done', terminationReason: 'normal' } as AgentEvent,
+    ];
+    const done = processAgentStream(fakeHandle(), eventsFrom(evts), 'scope', undefined, noRecord, flush);
+
+    // First flush is stuck on the slow API; the remaining events must still
+    // drain (they do not wait for the network).
+    await waitFor(() => flushCalls.length >= 1);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(flushCalls).toHaveLength(1);
+
+    gate.resolve();
+    await done;
+    // One in-flight snapshot + the coalesced latest terminal snapshot — not
+    // one send per event chasing the API.
+    expect(flushCalls).toHaveLength(2);
+    expect(flushCalls[1]).toBe('abc');
+  });
+
+  it('a transient flush failure does not stall the stream; terminal state still delivered', async () => {
+    const failures: unknown[] = [];
+    const flush = async (state: {
+      terminal: string;
+      blocks: Array<{ kind: string; content?: string }>;
+    }) => {
+      const text = state.blocks.map((b) => b.content ?? '').join('');
+      if (text === 'ab' && state.terminal === 'running') throw new Error('transient network');
+    };
+    const evts: AgentEvent[] = [
+      { type: 'text', delta: 'a' } as AgentEvent,
+      { type: 'text', delta: 'b' } as AgentEvent,
+      { type: 'text', delta: 'c' } as AgentEvent,
+      { type: 'done', terminationReason: 'normal' } as AgentEvent,
+    ];
+    const finalState = await processAgentStream(
+      fakeHandle(),
+      eventsFrom(evts),
+      'scope',
+      undefined,
+      noRecord,
+      flush,
+      {
+        onFlushError: (err) => failures.push(err),
+      },
+    );
+    expect(finalState.terminal).toBe('done');
+    expect(failures).toHaveLength(1);
+  });
+
+  it('terminal snapshot is never overwritten by an older running snapshot', async () => {
+    const order: string[] = [];
+    const gates: Deferred[] = [];
+    const flush = async (state: { terminal: string; blocks: Array<{ kind: string; content?: string }> }) => {
+      const text = state.blocks.map((b) => b.content ?? '').join('');
+      order.push(`${state.terminal}:${text}`);
+      if (order.length === 1) {
+        const gate = deferred();
+        gates.push(gate);
+        await gate.promise;
+      }
+    };
+    const evts: AgentEvent[] = [
+      { type: 'text', delta: 'progress' } as AgentEvent,
+      { type: 'done', terminationReason: 'normal' } as AgentEvent,
+    ];
+    const done = processAgentStream(fakeHandle(), eventsFrom(evts), 'scope', undefined, noRecord, flush);
+    await waitFor(() => order.length >= 1);
+    gates[0]!.resolve();
+    await done;
+    expect(order[order.length - 1]).toMatch(/^done:/);
+  });
+});
+
 function toolContainerCount(card: object): number {
   const elements = (card as {
     body?: {

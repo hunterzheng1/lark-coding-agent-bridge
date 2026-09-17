@@ -19,6 +19,7 @@ import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
 import { renderCard, type RunCardProgress } from '../card/run-renderer';
 import { ResilientCardUpdater } from '../card/resilient-updater';
+import { SnapshotScheduler } from '../card/snapshot-scheduler';
 import {
   buildTerminalNotice,
   finalizeIfRunning,
@@ -1237,7 +1238,6 @@ export async function processAgentStream(
   let completedTools = 0;
   const inFlightTools = new Set<string>();
   let flushFailureLogged = false;
-  let flushQueue: Promise<unknown> = Promise.resolve();
   const progressSnapshot = (): RunCardProgress => {
     const now = Date.now();
     return {
@@ -1248,17 +1248,21 @@ export async function processAgentStream(
       inFlightTools: inFlightTools.size,
     };
   };
-  const safeFlush = async (nextState: RunState): Promise<void> => {
-    const queued = flushQueue.then(() => flush(nextState, progressSnapshot()));
-    flushQueue = queued.catch(() => undefined);
-    try {
-      await queued;
-      try {
-        hooks?.onFlushSuccess?.();
-      } catch (hookErr) {
-        log.fail('stream', hookErr, { step: 'onFlushSuccess' });
+
+  // OPT-02 delivery scheduling: event consumption never waits on a network
+  // update. Offers coalesce to the newest snapshot while one send is in
+  // flight; the terminal snapshot goes out last with bounded retries.
+  const delivery = new SnapshotScheduler<RunState>({
+    send: (snapshot) => flush(snapshot, progressSnapshot()),
+    onResult: (ok, err) => {
+      if (ok) {
+        try {
+          hooks?.onFlushSuccess?.();
+        } catch (hookErr) {
+          log.fail('stream', hookErr, { step: 'onFlushSuccess' });
+        }
+        return;
       }
-    } catch (err) {
       try {
         hooks?.onFlushError?.(err);
       } catch (hookErr) {
@@ -1268,7 +1272,10 @@ export async function processAgentStream(
         flushFailureLogged = true;
         log.fail('stream', err, { step: 'progress-update' });
       }
-    }
+    },
+  });
+  const safeFlush = (nextState: RunState): void => {
+    delivery.offer(nextState);
   };
 
   // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
@@ -1315,7 +1322,7 @@ export async function processAgentStream(
     heartbeatTimer = setTimeout(() => {
       heartbeatTimer = undefined;
       void (async () => {
-        await safeFlush(windowState(state, WINDOW_OPTS));
+        safeFlush(windowState(state, WINDOW_OPTS));
         try {
           await hooks.onHeartbeat?.(Date.now() - runStart, currentTool);
         } catch (err) {
@@ -1382,7 +1389,7 @@ export async function processAgentStream(
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
-      await safeFlush(windowState(state, WINDOW_OPTS));
+      safeFlush(windowState(state, WINDOW_OPTS));
       // Stop iterating as soon as we have a terminal state. Some claude
       // versions don't close stdout immediately after the result event, which
       // would leave the for-await waiting forever otherwise.
@@ -1410,7 +1417,24 @@ export async function processAgentStream(
   log.info('card', 'final', { terminal: state.terminal, interrupted: handle.interrupted });
   reportMetric('run_e2e_ms', Date.now() - runStart, { terminal: state.terminal });
   const windowedFinal = windowState(state, WINDOW_OPTS);
-  await safeFlush(windowedFinal);
+  // Terminal barrier: awaited, retried a bounded number of times, and always
+  // the last snapshot on the wire (older running snapshots can't cover it).
+  await delivery.finish(windowedFinal);
+  const deliveryStats = delivery.getStats();
+  const deliveryLagMs = deliveryStats.lastDeliverySuccessAt
+    ? deliveryStats.lastDeliverySuccessAt - lastActivityAt
+    : undefined;
+  log.info('stream', 'delivery-stats', {
+    offered: deliveryStats.offered,
+    delivered: deliveryStats.delivered,
+    coalesced: deliveryStats.coalesced,
+    failures: deliveryStats.failures,
+    lastErrorCategory: deliveryStats.lastErrorCategory,
+    deliveryLagMs,
+  });
+  reportMetric('card_delivery_lag_ms', deliveryLagMs ?? -1, { terminal: state.terminal });
+  reportMetric('card_delivery_failures', deliveryStats.failures, { terminal: state.terminal });
+  reportMetric('card_delivery_coalesced', deliveryStats.coalesced, { terminal: state.terminal });
   const reservedFinalTruncated = (state.finalText?.trim().length ?? 0) > WINDOW_OPTS.maxTextChars;
   try {
     hooks?.onTerminal?.(
