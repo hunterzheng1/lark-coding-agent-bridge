@@ -61,7 +61,7 @@
 
 ### 剩余事项
 
-- ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`）：`recoveryCard` 带「🔁 重做任务」「忽略」按钮；`inbound.redo` 将旧 uncertain/expired 记录落定为 redone 并以新 messageId 经正常 pending → 派发（重新过权限校验）→ claim → terminal 生命周期执行；`inbound.dismiss` 落定不执行；二次点击幂等。按钮为未签名 cmd 按钮（同 help 卡路径），聊天/用户准入沿用 dispatcher 既有检查，未改回调鉴权边界。
+- ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
 - 真实进程 kill 级故障注入未做（测试以进程内模拟替代）；`delivery_pending` 未作为独立状态（终态即落定，最终卡片投递失败不影响 journal 状态）。
 - 云文档评论入口（comment scope）未接 journal（该入口不经过 im intake 路径）。
 - 优雅停机时 `pending.cancelAll` 丢弃的消息依赖下次启动的重放兜底；若用户在停机期间已在别处重做同一任务，重启重放会执行一次重复任务（去重仅按 messageId，无法识别语义重复）。
