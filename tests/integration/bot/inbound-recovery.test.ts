@@ -45,6 +45,10 @@ interface FakeLarkChannel {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
+  /** Set true when getChatMode is called; cleared by tests before gating. */
+  chatModeRequested: boolean;
+  /** When set, getChatMode parks on it — deterministic intake gating. */
+  chatModeGate: Promise<void> | undefined;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   createCard(cardJson: unknown): Promise<{ cardId: string }>;
   updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void>;
@@ -229,6 +233,8 @@ function createFakeLarkChannel(): FakeLarkChannel {
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     handlers,
     sent,
+    chatModeRequested: false,
+    chatModeGate: undefined,
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
       application: {
@@ -257,6 +263,8 @@ function createFakeLarkChannel(): FakeLarkChannel {
     async connect() {},
     async disconnect() {},
     async getChatMode() {
+      channel.chatModeRequested = true;
+      if (channel.chatModeGate) await channel.chatModeGate;
       return 'group';
     },
     getConnectionStatus() {
@@ -522,6 +530,82 @@ describe('优雅停机显式取消（评审五轮）', () => {
     await onDisk.load();
     expect(onDisk.list('oc_dm')[0]?.status).toBe('terminal');
     expect(onDisk.list('oc_dm')[0]?.terminalState).toBe('rejected');
+  }, 20_000);
+});
+
+describe('停机关闭任务生产入口（评审七轮）', () => {
+  it('disconnect inside the startup-recovery grace cancels replay and recovery cards', async () => {
+    const dir = await mkdtempInbound();
+    const seeded = new InboundJournal(dir);
+    await seeded.recordAccepted({
+      messageId: 'om_replay',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'replay bait',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await seeded.recordAccepted({
+      messageId: 'om_uncertain',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'uncertain bait',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await seeded.markClaimed('oc_dm', ['om_uncertain'], 'run-lost');
+    await seeded.flush();
+
+    const h = await startBridge({ journalDir: dir });
+    // The tracked recovery task sits in its 1.5s handshake grace — the exact
+    // window where pendingSettles used to look empty while a replay +
+    // notification were about to be produced.
+    const startedAt = Date.now();
+    await h.bridge.disconnect();
+    // The grace woke early on abort instead of being waited out (or, worse,
+    // returned while still untracked).
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+
+    // Past the 1.5s grace + replay debounce: nothing may have been produced.
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(h.agent.runs).toHaveLength(0);
+    expect(
+      h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
+    ).toBe(false);
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.getRecord('oc_dm', 'om_replay')?.status).toBe('queued');
+  }, 20_000);
+
+  it('disconnect waits a gated intake and the resumed handler stops before journaling/dispatch', async () => {
+    const dir = await mkdtempInbound();
+    const h = await startBridge({ journalDir: dir });
+    let releaseGate!: () => void;
+    h.channel.chatModeGate = new Promise<void>((r) => (releaseGate = r));
+    h.channel.chatModeRequested = false;
+    const delivered = Promise.resolve(
+      h.channel.handlers.message?.(message('gated intake task')),
+    );
+    await waitFor(() => h.channel.chatModeRequested, 8000);
+
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(releaseGate, 900);
+    await disconnecting;
+    await delivered;
+
+    // Intake is lifecycle-tracked from entry: disconnect waited for it to
+    // resume instead of draining an empty set and flushing early.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(800);
+    // The resumed handler re-checked the shutdown gate: no journal record,
+    // no armed dispatch.
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm')).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 900)); // past any debounce window
+    expect(h.agent.runs).toHaveLength(0);
   }, 20_000);
 });
 

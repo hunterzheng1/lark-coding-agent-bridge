@@ -356,11 +356,24 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // pending flow — fresh policy checks at dispatch. Claimed records whose run
   // has no known terminal state are `uncertain`: notified, never auto-rerun.
   if (inboundJournal) {
-    void (async () => {
+    // 评审七轮: the recovery task is a producer (pending.push + recovery
+    // cards) — it must be lifecycle-tracked from entry and must stop at the
+    // shutdown gate, or disconnect can drain (set still empty during the
+    // 1.5s grace) and return while the old instance is about to replay.
+    void trackSettle((async () => {
       try {
         const recovery = await inboundJournal.recoverOnStartup();
-        // Give the WS handshake a moment before replaying or notifying.
-        await new Promise((r) => setTimeout(r, 1_500));
+        // Give the WS handshake a moment before replaying or notifying —
+        // woke early by shutdown so disconnect never waits out the grace.
+        await sleepUntilAbort(shutdown.signal, 1_500);
+        if (shutdown.signal.aborted) {
+          log.info('inbound', 'startup-recovery-cancelled', {
+            requeue: recovery.requeue.length,
+            uncertain: recovery.uncertain.length,
+            expired: recovery.expired.length,
+          });
+          return;
+        }
         for (const record of recovery.requeue) {
           log.info('inbound', 'recovery-requeue', {
             scope: record.scope,
@@ -406,7 +419,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       } catch (err) {
         log.fail('inbound', err, { step: 'startup-recovery' });
       }
-    })();
+    })());
   }
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
@@ -414,29 +427,51 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 
   channel.on({
     message: async (msg) => {
-      await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, () =>
-        intakeMessage({
-          channel,
-          agent,
-          sessions,
-          sessionCatalog,
-          workspaces,
-          thinkingHistory,
-          inboundJournal,
-          activeRuns,
-          pending,
-          msg,
-          controls,
-          chatModeCache,
-          executor,
-          pool,
-        }),
-      ).catch((err) => log.fail('intake', err));
+      // 评审七轮: intake is a task PRODUCER. It must be lifecycle-tracked
+      // from entry (its chat-mode/thread/command awaits happen long before
+      // any batch exists to track) and refused once shutdown started —
+      // otherwise disconnect can observe an empty settle set, flush, and
+      // return while this handler is still heading for its journal write
+      // and pending.push.
+      if (shutdown.signal.aborted) {
+        log.info('intake', 'rejected-by-shutdown', {
+          chatId: msg.chatId,
+          msgId: msg.messageId,
+        });
+        return;
+      }
+      await trackSettle(
+        withTrace({ chatId: msg.chatId, msgId: msg.messageId }, () =>
+          intakeMessage({
+            channel,
+            agent,
+            sessions,
+            sessionCatalog,
+            workspaces,
+            thinkingHistory,
+            inboundJournal,
+            activeRuns,
+            pending,
+            msg,
+            controls,
+            chatModeCache,
+            executor,
+            pool,
+            shutdownSignal: shutdown.signal,
+          }),
+        ).catch((err) => log.fail('intake', err)),
+      );
     },
     reject: (evt) => {
       log.info('intake', 'reject', { chatId: evt.chatId, reason: evt.reason });
     },
     cardAction: async (evt) => {
+      // Producer entry: card callbacks can journal/claim/dispatch — refuse
+      // them wholesale once shutdown started (评审七轮).
+      if (shutdown.signal.aborted) {
+        log.info('cardAction', 'rejected-by-shutdown', { messageId: evt.messageId });
+        return;
+      }
       await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
         await handleCardAction({
           channel,
@@ -459,6 +494,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       }).catch((err) => log.fail('cardAction', err));
     },
     comment: async (evt) => {
+      if (shutdown.signal.aborted) {
+        log.info('comment', 'rejected-by-shutdown', { commentId: evt.commentId });
+        return;
+      }
       await withTrace({ chatId: 'comment' }, async () => {
         await handleCommentMention({
           channel,
@@ -617,6 +656,29 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 }
 
 /**
+ * OPT-04 (评审七轮): a setTimeout grace that wakes early on shutdown so a
+ * fixed delay (e.g. the startup-recovery handshake wait) never blocks
+ * disconnect. Resolves on either expiry or abort; always clears the timer.
+ */
+function sleepUntilAbort(signal: AbortSignal, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
  * Expected cancellation raised when graceful shutdown aborts a pre-spawn
  * await. Distinct from failures so the flush path can log it as info
  * instead of error telemetry.
@@ -718,6 +780,7 @@ interface IntakeDeps {
   chatModeCache: ChatModeCache;
   executor: RunExecutor;
   pool: ProcessPool;
+  shutdownSignal: AbortSignal;
 }
 
 async function intakeMessage(deps: IntakeDeps): Promise<void> {
@@ -736,6 +799,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     chatModeCache,
     executor,
     pool,
+    shutdownSignal,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -837,6 +901,15 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // OPT-04: journal the accepted message before it enters the in-memory
   // queue, so a crash/restart cannot silently drop it. Commands are not
   // journaled — they are not agent dispatches.
+  // 评审七轮: re-check the shutdown gate HERE (after the chat-mode / thread
+  // lookup / command-context awaits). If disconnect fired while this intake
+  // was in flight, the old instance must NOT journal a fresh record or arm a
+  // dispatch timer — the incoming event is dropped and the next start replays
+  // from the journal's own queued records.
+  if (shutdownSignal.aborted) {
+    log.info('intake', 'dropped-by-shutdown', { scope, messageId: msg.messageId });
+    return;
+  }
   if (inboundJournal) {
     const result = await inboundJournal
       .recordAccepted({
@@ -861,6 +934,13 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     }
   }
 
+  // 评审七轮: last gate before arming the dispatch timer. An abort during
+  // the recordAccepted await above leaves the record queued (replayed next
+  // start); we must not hand the old instance a live dispatch to run.
+  if (shutdownSignal.aborted) {
+    log.info('intake', 'dispatch-skipped-by-shutdown', { scope, messageId: msg.messageId });
+    return;
+  }
   const size = pending.push(scope, routedMessage);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
