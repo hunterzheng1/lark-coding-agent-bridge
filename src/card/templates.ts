@@ -1,3 +1,6 @@
+import { escapeMd } from './markdown';
+import type { ModelSelection } from './model-card';
+
 interface ButtonSpec {
   text: string;
   value: Record<string, unknown>;
@@ -85,7 +88,7 @@ export interface StatusInfo {
    * bridge override when set; `source: 'cli'` means no override is stored and
    * the CLI resolves its own model. This is the *selection*, not a model the
    * upstream reported actually running. */
-  model?: { value?: string; source: 'override' | 'cli' };
+  model?: ModelSelection;
 }
 
 export function statusCard(info: StatusInfo): object {
@@ -220,10 +223,6 @@ export function helpCard(agentName = 'Agent'): object {
       { text: '🆕 新会话', value: { cmd: 'new' } },
     ]),
   ]);
-}
-
-function escapeMd(s: string): string {
-  return s.replace(/([*_`\\])/g, '\\$1');
 }
 
 function escapeCode(s: string): string {

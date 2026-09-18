@@ -87,4 +87,20 @@ describe('modelSelectCard (OPT-07 slice B)', () => {
     expect(json).toContain('模型列表获取失败');
     expect(json).toContain('手动输入模型 ID');
   });
+
+  it('renders a stale catalog with its original fetch time and usable candidates', () => {
+    const stale: ModelCatalogResult = {
+      ...catalog(2),
+      status: 'stale',
+      note: '刷新失败，以下为上次获取的候选列表（可能已过期）。',
+    };
+    const card = modelSelectCard(base({ catalog: stale }));
+    const json = JSON.stringify(card);
+    expect(json).toContain('刷新失败');
+    expect(json).toContain('上次更新');
+    // The last good list stays selectable instead of collapsing to manual-only.
+    const options = findSelectOptions(card);
+    expect(options.some((o) => o.value === 'model-0')).toBe(true);
+    expect(options.some((o) => o.value === 'model-1')).toBe(true);
+  });
 });

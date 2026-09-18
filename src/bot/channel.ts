@@ -84,6 +84,15 @@ const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
+/**
+ * OPT-07 Slice C: the model snapshot frozen at intake, keyed by the exact
+ * queued message object. The inbound journal is the durable snapshot source;
+ * this sidecar exists so the flush-time grouping keeps freeze-at-acceptance
+ * semantics even when a caller runs without a journal (production always
+ * creates one). Entries vanish with their messages (WeakMap).
+ */
+const intakeModelSnapshots = new WeakMap<NormalizedMessage, string | undefined>();
+
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
   '不要 unset LARK_CHANNEL / LARK_CHANNEL_HOME / LARK_CHANNEL_PROFILE / LARKSUITE_CLI_CONFIG_DIR，也不要用 env -u LARK_CHANNEL 绕回本机普通配置。',
@@ -325,13 +334,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           // accepted after it, and already-received/queued messages keep their
           // snapshot. A shutdown between groups leaves the not-yet-run records
           // `queued`, so the next startup replays them (rule 7).
-          const fallbackModel = inboundJournal
-            ? undefined
-            : sessions.getModelPreference(scope, agent.id)?.model;
+          // The journal record is the durable snapshot source; intake also
+          // freezes the same value per message object (WeakMap sidecar) so
+          // snapshot semantics hold even when a caller runs without a journal.
           const snapshotOf = (m: NormalizedMessage): string | undefined =>
             inboundJournal
               ? inboundJournal.getRecord(scope, m.messageId)?.model
-              : fallbackModel;
+              : intakeModelSnapshots.get(m);
           const groups = groupBatchByModelSnapshot(batch, snapshotOf);
           const batchDeps = {
             channel,
@@ -954,6 +963,11 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'dropped-by-shutdown', { scope, messageId: msg.messageId });
     return;
   }
+  // OPT-07 Slice C: freeze the target model ONCE at acceptance. The same
+  // value goes to the journal record (durable) and the per-message WeakMap
+  // (in-memory fallback for journal-less callers), so a later /model change
+  // cannot rewrite this message; dispatch groups by it.
+  const acceptedModel = sessions.getModelPreference(scope, agent.id)?.model;
   if (inboundJournal) {
     const result = await inboundJournal
       .recordAccepted({
@@ -963,9 +977,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
         senderId: msg.senderId,
         content: msg.content,
         acceptedAt: msg.createTime || Date.now(),
-        // OPT-07 Slice C: freeze the target model at acceptance so a later
-        // /model change cannot rewrite this message; dispatch groups by it.
-        model: sessions.getModelPreference(scope, agent.id)?.model,
+        model: acceptedModel,
         ...(msg.threadId ? { threadId: msg.threadId } : {}),
         ...(msg.chatType === 'p2p' ? { chatType: 'p2p' as const } : { chatType: 'group' as const }),
       })
@@ -988,6 +1000,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'dispatch-skipped-by-shutdown', { scope, messageId: msg.messageId });
     return;
   }
+  intakeModelSnapshots.set(routedMessage, acceptedModel);
   const size = pending.push(scope, routedMessage);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }

@@ -1,4 +1,6 @@
 import type { ModelCatalogResult } from '../agent/model-catalog';
+import { MODEL_ID_MAX_LEN } from '../agent/model-catalog';
+import { escapeMd } from './markdown';
 
 /**
  * OPT-07 Slice B: the model selection card. Mirrors the `/config` form pattern
@@ -8,12 +10,24 @@ import type { ModelCatalogResult } from '../agent/model-catalog';
  * verbatim — the card never claims a candidate is callable.
  */
 
+/** The saved model selection for a scope + backend: the bridge override value
+ * when set, otherwise "follow the CLI's own resolution". This is the
+ * *selection*, never a model the upstream reported actually running. */
+export interface ModelSelection {
+  value?: string;
+  source: 'override' | 'cli';
+}
+
+export function modelSelection(pref: { model: string } | undefined): ModelSelection {
+  return pref ? { value: pref.model, source: 'override' } : { source: 'cli' };
+}
+
 export interface ModelCardInput {
   agentName: string;
   /** 作用范围 label, e.g. 当前话题（同话题成员共享）. */
   scopeLabel: string;
   /** Current selection for this scope + backend. */
-  current: { value?: string; source: 'override' | 'cli' };
+  current: ModelSelection;
   catalog: ModelCatalogResult;
   /** Bumped on every preference write; re-validated on submit/reset. */
   revision: number;
@@ -23,22 +37,17 @@ export interface ModelCardInput {
 
 const MAX_OPTIONS = 30;
 const MAX_LABEL = 48;
-/** Feishu caps option/button labels well below this; truncate defensively. */
-const MAX_ID = 120;
 
-function escapeMd(value: string): string {
-  return value.replace(/([*_`\\])/g, '\\$1');
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
-
-function formatTime(epochMs: number): string {
+/** Shared by the selection card and the `/model list` text output. */
+export function formatModelTime(epochMs: number): string {
   const d = new Date(epochMs);
   if (Number.isNaN(d.getTime())) return '未知';
   const pad = (n: number): string => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 export function modelSelectCard(input: ModelCardInput): object {
@@ -47,12 +56,14 @@ export function modelSelectCard(input: ModelCardInput): object {
 
   const selectionLine =
     input.current.source === 'override' && input.current.value
-      ? `当前选择：${escapeMd(truncate(input.current.value, MAX_ID))}`
+      ? `当前选择：${escapeMd(truncate(input.current.value, MODEL_ID_MAX_LEN))}`
       : '当前选择：跟随 CLI 设置（未覆盖）';
   const statusLine =
     catalog.status === 'failed'
       ? `⚠️ ${escapeMd(catalog.note)}`
-      : `候选来源：${escapeMd(catalog.note)} · 更新时间 ${formatTime(catalog.fetchedAt)}`;
+      : catalog.status === 'stale'
+        ? `⚠️ ${escapeMd(catalog.note)} · 上次更新 ${formatModelTime(catalog.fetchedAt)}`
+        : `候选来源：${escapeMd(catalog.note)} · 更新时间 ${formatModelTime(catalog.fetchedAt)}`;
 
   elements.push({
     tag: 'markdown',
@@ -75,7 +86,7 @@ export function modelSelectCard(input: ModelCardInput): object {
       elements.push({
         tag: 'markdown',
         content: optionCandidates
-          .map((c) => `• \`${escapeMd(truncate(c.id, MAX_ID))}\`${c.displayName !== c.id ? ` — ${escapeMd(truncate(c.displayName, MAX_LABEL))}` : ''}`)
+          .map((c) => `• \`${escapeMd(truncate(c.id, MODEL_ID_MAX_LEN))}\`${c.displayName !== c.id ? ` — ${escapeMd(truncate(c.displayName, MAX_LABEL))}` : ''}`)
           .join('\n'),
       });
     }
@@ -93,16 +104,16 @@ export function modelSelectCard(input: ModelCardInput): object {
       tag: 'plain_text',
       content: truncate(
         c.displayName !== c.id ? `${c.displayName} (${c.id})` : c.id,
-        MAX_LABEL + MAX_ID,
+        MAX_LABEL + MODEL_ID_MAX_LEN,
       ),
     },
-    value: truncate(c.id, MAX_ID),
+    value: truncate(c.id, MODEL_ID_MAX_LEN),
   }));
 
   // Keep the dropdown valid when the saved override is not among candidates
   // (e.g. a manual id set earlier).
   if (input.current.source === 'override' && input.current.value) {
-    const saved = truncate(input.current.value, MAX_ID);
+    const saved = truncate(input.current.value, MODEL_ID_MAX_LEN);
     if (!options.some((option) => option.value === saved)) {
       options.unshift({
         text: { tag: 'plain_text', content: `${truncate(saved, MAX_LABEL)}（当前）` },
@@ -121,7 +132,7 @@ export function modelSelectCard(input: ModelCardInput): object {
       tag: 'select_static',
       name: 'model',
       ...(input.current.source === 'override' && input.current.value
-        ? { initial_option: truncate(input.current.value, MAX_ID) }
+        ? { initial_option: truncate(input.current.value, MODEL_ID_MAX_LEN) }
         : {}),
       placeholder: { tag: 'plain_text', content: '选择模型' },
       options,

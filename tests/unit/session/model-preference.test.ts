@@ -100,6 +100,23 @@ describe('SessionStore model preference (OPT-07)', () => {
     expect(store.getRaw('chat-1')?.sessionId).toBe('sess-1');
   });
 
+  it('keeps profiles isolated (separate store files never share selections)', async () => {
+    const profileA = await fresh();
+    const profileB = await fresh();
+    await profileA.store.setModelPreference('chat-1', 'claude', 'profile-a-model');
+    expect(profileA.store.getModelPreference('chat-1', 'claude')?.model).toBe('profile-a-model');
+    // A different Profile is a different sessions file; nothing bleeds over.
+    expect(profileB.store.getModelPreference('chat-1', 'claude')).toBeUndefined();
+  });
+
+  it('keeps regular-group and topic scopes isolated within a profile', async () => {
+    const { store } = await fresh();
+    await store.setModelPreference('chat-1', 'claude', 'group-model');
+    await store.setModelPreference('chat-1:thread-9', 'claude', 'topic-model');
+    expect(store.getModelPreference('chat-1', 'claude')?.model).toBe('group-model');
+    expect(store.getModelPreference('chat-1:thread-9', 'claude')?.model).toBe('topic-model');
+  });
+
   it('drops malformed model preference records on load', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'sess-model-bad-'));
     cleanups.push(async () =>

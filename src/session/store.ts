@@ -10,6 +10,17 @@ export interface ModelPreference {
   savedAt: number;
 }
 
+/** Thrown by setModelPreference/clearModelPreference when `expectedRevision`
+ * no longer matches the stored revision — a concurrent mutation won the race
+ * and nothing was changed. Lets a stale card be rejected at COMMIT time, not
+ * just at the earlier guard read (which sits behind an await boundary). */
+export class ModelRevisionConflictError extends Error {
+  constructor() {
+    super('model preference revision conflict');
+    this.name = 'ModelRevisionConflictError';
+  }
+}
+
 export interface SessionEntry {
   /** May be absent if the entry was created by /timeout before any run
    * recorded a session id. Treat absence as "no resumable session". */
@@ -39,6 +50,10 @@ type SessionMap = Record<string, SessionEntry>;
 export class SessionStore {
   private data: SessionMap = {};
   private saving: Promise<void> = Promise.resolve();
+  /** Serializes durable model-preference mutations so their read → write →
+   * rollback sequences cannot interleave (a failed write's rollback would
+   * otherwise clobber a concurrent successful write). */
+  private prefWrites: Promise<unknown> = Promise.resolve();
   private readonly path: string;
 
   constructor(path: string = paths.sessionsFile) {
@@ -208,42 +223,89 @@ export class SessionStore {
    * Save the model override and wait until it is durably on disk before
    * resolving (rule: acknowledge success only after persistence). On write
    * failure the previous value is restored and the error rethrown.
+   *
+   * When `expectedRevision` is given, the write additionally requires the
+   * stored revision to still equal it at commit time; otherwise it throws
+   * {@link ModelRevisionConflictError} without touching any state. Mutations
+   * are serialized per store, so the check and the write are atomic.
    */
-  async setModelPreference(chatId: string, agentId: string, model: string): Promise<void> {
-    const prev = this.data[chatId];
-    const next: SessionEntry = {
-      ...(prev ?? { updatedAt: Date.now() }),
-      modelPreferences: {
-        ...(prev?.modelPreferences ?? {}),
-        [agentId]: { model, savedAt: Date.now() },
-      },
-      modelRevision: (prev?.modelRevision ?? 0) + 1,
-      updatedAt: Date.now(),
-    };
-    await this.commitPreference(chatId, prev, next);
+  async setModelPreference(
+    chatId: string,
+    agentId: string,
+    model: string,
+    expectedRevision?: number,
+  ): Promise<void> {
+    await this.enqueueModelWrite(() =>
+      this.commitModelPreference(
+        chatId,
+        (prev) => ({
+          ...(prev ?? { updatedAt: Date.now() }),
+          modelPreferences: {
+            ...(prev?.modelPreferences ?? {}),
+            [agentId]: { model, savedAt: Date.now() },
+          },
+          modelRevision: (prev?.modelRevision ?? 0) + 1,
+          updatedAt: Date.now(),
+        }),
+        expectedRevision,
+      ),
+    );
   }
 
   /**
    * Remove the override so the scope follows the CLI's own model resolution.
    * Resolves false when nothing was set (no write). Resolves true only after
    * the removal is durably persisted; restores the prior value on write
-   * failure and rethrows.
+   * failure and rethrows. See {@link setModelPreference} for the
+   * `expectedRevision` conflict semantics.
    */
-  async clearModelPreference(chatId: string, agentId: string): Promise<boolean> {
+  async clearModelPreference(
+    chatId: string,
+    agentId: string,
+    expectedRevision?: number,
+  ): Promise<boolean> {
+    return this.enqueueModelWrite(async () => {
+      const prev = this.data[chatId];
+      if (expectedRevision !== undefined && (prev?.modelRevision ?? 0) !== expectedRevision) {
+        throw new ModelRevisionConflictError();
+      }
+      const existing = prev?.modelPreferences?.[agentId];
+      if (!prev || !existing) return false;
+      const remaining = { ...prev.modelPreferences };
+      delete remaining[agentId];
+      const { modelPreferences: _drop, ...rest } = prev;
+      const next: SessionEntry = {
+        ...rest,
+        ...(Object.keys(remaining).length > 0 ? { modelPreferences: remaining } : {}),
+        modelRevision: (prev.modelRevision ?? 0) + 1,
+        updatedAt: Date.now(),
+      };
+      await this.commitPreference(chatId, prev, next);
+      return true;
+    });
+  }
+
+  private enqueueModelWrite<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.prefWrites.then(op);
+    // The shared chain keeps advancing past a rejected write…
+    this.prefWrites = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    // …while this caller still sees the original failure.
+    return run;
+  }
+
+  private async commitModelPreference(
+    chatId: string,
+    buildNext: (prev: SessionEntry | undefined) => SessionEntry,
+    expectedRevision: number | undefined,
+  ): Promise<void> {
     const prev = this.data[chatId];
-    const existing = prev?.modelPreferences?.[agentId];
-    if (!prev || !existing) return false;
-    const remaining = { ...prev.modelPreferences };
-    delete remaining[agentId];
-    const { modelPreferences: _drop, ...rest } = prev;
-    const next: SessionEntry = {
-      ...rest,
-      ...(Object.keys(remaining).length > 0 ? { modelPreferences: remaining } : {}),
-      modelRevision: (prev.modelRevision ?? 0) + 1,
-      updatedAt: Date.now(),
-    };
-    await this.commitPreference(chatId, prev, next);
-    return true;
+    if (expectedRevision !== undefined && (prev?.modelRevision ?? 0) !== expectedRevision) {
+      throw new ModelRevisionConflictError();
+    }
+    await this.commitPreference(chatId, prev, buildNext(prev));
   }
 
   private async commitPreference(

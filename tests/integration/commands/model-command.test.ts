@@ -403,6 +403,59 @@ describe('/model command basics (OPT-07 slice A carried forward)', () => {
   });
 });
 
+describe('/model 评审修复 (stale catalog + commit-time conflict)', () => {
+  it('/model list shows a stale catalog with its last-updated time and candidates', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    const stale: ModelCatalogResult = {
+      ...CANNED,
+      status: 'stale',
+      note: '刷新失败，以下为上次获取的候选列表（可能已过期）。',
+    };
+    await tryHandleCommand(
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model list',
+        discoverModels: stubDiscover(stale),
+      }),
+    );
+    const text = lastMarkdown(channel);
+    expect(text).toContain('刷新失败');
+    expect(text).toContain('上次更新');
+    expect(text).toContain('m1');
+    expect(text).toContain('跟随 CLI 设置');
+  });
+
+  it('two cards bound to the same revision: exactly one submit wins', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await sessions.setModelPreference('chat-1', 'claude', 'current'); // revision -> 1
+    const mkCtx = (formValue: Record<string, unknown>) =>
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        formValue,
+        discoverModels: stubDiscover(),
+      });
+    // Both cards were rendered at revision 1; they race through guard → write.
+    await Promise.all([
+      runCommandHandler('model', 'submit 1', mkCtx({ model: 'm1' })),
+      runCommandHandler('model', 'submit 1', mkCtx({ model: 'm2' })),
+    ]);
+    // Exactly one apply succeeded; the loser was rejected with the stale-card
+    // reply (at the guard or, after a lost race, at the commit-time check).
+    const replies = channel.sent.map((entry) => String((entry.content as { markdown?: string }).markdown ?? ''));
+    expect(replies.filter((text) => text.includes('已保存'))).toHaveLength(1);
+    expect(replies.some((text) => text.includes('过期'))).toBe(true);
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('m1');
+    expect(sessions.getModelRevision('chat-1')).toBe(2);
+  });
+});
+
 describe('commandKeepsPendingQueue', () => {
   it('keeps the queue only for /model', () => {
     expect(commandKeepsPendingQueue('/model')).toBe(true);

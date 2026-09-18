@@ -7,6 +7,7 @@ import { capabilityForAgentKind, type AgentCapabilityId } from '../agent/capabil
 import type { AgentAdapter } from '../agent/types';
 import {
   discoverModelCatalog,
+  MODEL_ID_MAX_LEN,
   type DiscoverModelsInput,
   type ModelCatalogResult,
 } from '../agent/model-catalog';
@@ -26,7 +27,11 @@ import {
   groupMsgScopeGrantedCard,
 } from '../card/config-card';
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
-import { modelSelectCard } from '../card/model-card';
+import {
+  formatModelTime,
+  modelSelectCard,
+  modelSelection,
+} from '../card/model-card';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
@@ -76,7 +81,10 @@ import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog'
 import type { ThinkingHistoryStore, ThinkingRecord } from '../session/thinking-history';
 import { shortRunId } from '../session/thinking-history';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
-import type { SessionStore } from '../session/store';
+import {
+  ModelRevisionConflictError,
+  type SessionStore,
+} from '../session/store';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { evaluateRunPolicy } from '../policy/run-policy';
 import type { ProcessPool } from '../bot/process-pool';
@@ -506,7 +514,12 @@ async function handleDoc(args: string, ctx: CommandContext): Promise<void> {
 
 // ─── /model (OPT-07: Slice A 命令闭环 + Slice B 选择卡) ──────────────────────
 
-const MODEL_ID_MAX_LEN = 120;
+/** Text-list cap. Plain text is cheap; the CARD dropdown keeps its own tighter
+ * Feishu budget (MAX_OPTIONS = 30 in model-card). */
+const MAX_TEXT_CANDIDATES = 40;
+/** Reply used both by the pre-write guard and by a commit-time revision
+ * conflict (a concurrent mutation winning between guard and write). */
+const STALE_CARD_REPLY = '⚠️ 该选择卡已过期（模型设置已被更新），请重新打开 `/model`。';
 
 async function handleModel(args: string, ctx: CommandContext): Promise<void> {
   const input = args.trim();
@@ -537,32 +550,41 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
 }
 
 /** Admin + revision-freshness gates shared by every mutation (text set, text
- * reset, card submit). Replies and returns false when the mutation must not
- * proceed. OPT-07 Slice C: switching while a run is active or messages are
- * queued is now ALLOWED — in-flight and already-received messages keep their
- * frozen model snapshot (dispatch groups by it), so a change only affects
- * messages accepted afterwards. */
+ * reset, card submit). Replies and returns not-ok when the mutation must not
+ * proceed. On ok, carries the card-bound revision (when one was supplied) so
+ * the store can re-check it at COMMIT time — the guard read and the write sit
+ * on opposite sides of an await, so the store check is the authoritative one.
+ * OPT-07 Slice C: switching while a run is active or messages are queued is
+ * ALLOWED — in-flight and already-received messages keep their frozen model
+ * snapshot (dispatch groups by it), so a change only affects messages
+ * accepted afterwards. */
 async function guardModelMutation(
   ctx: CommandContext,
   revisionArg: string | undefined,
-): Promise<boolean> {
+): Promise<{ ok: true; expectedRevision?: number } | { ok: false }> {
   const admin = canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
   if (!admin.ok) {
     await reply(ctx, '❌ 切换/恢复模型仅管理员或 bot owner 可用；查看请使用 `/model`。');
-    return false;
+    return { ok: false };
   }
   if (revisionArg !== undefined) {
     const bound = Number.parseInt(revisionArg, 10);
     if (!Number.isFinite(bound) || bound !== ctx.sessions.getModelRevision(ctx.scope)) {
-      await reply(ctx, '⚠️ 该选择卡已过期（模型设置已被更新），请重新打开 `/model`。');
-      return false;
+      await reply(ctx, STALE_CARD_REPLY);
+      return { ok: false };
     }
+    return { ok: true, expectedRevision: bound };
   }
-  return true;
+  return { ok: true };
+}
+
+function isRevisionConflict(err: unknown): boolean {
+  return err instanceof ModelRevisionConflictError;
 }
 
 async function handleModelSet(ctx: CommandContext, idRaw: string): Promise<void> {
-  if (!(await guardModelMutation(ctx, undefined))) return;
+  const guard = await guardModelMutation(ctx, undefined);
+  if (!guard.ok) return;
   const validation = validateModelId(idRaw);
   if (!validation.ok) {
     await reply(
@@ -571,18 +593,27 @@ async function handleModelSet(ctx: CommandContext, idRaw: string): Promise<void>
     );
     return;
   }
-  await applyModel(ctx, validation.modelId);
+  await applyModel(ctx, validation.modelId, guard.expectedRevision);
 }
 
 async function handleModelReset(
   ctx: CommandContext,
   revisionArg: string | undefined,
 ): Promise<void> {
-  if (!(await guardModelMutation(ctx, revisionArg))) return;
+  const guard = await guardModelMutation(ctx, revisionArg);
+  if (!guard.ok) return;
   let cleared: boolean | null;
   try {
-    cleared = await ctx.sessions.clearModelPreference(ctx.scope, ctx.agent.id);
-  } catch {
+    cleared = await ctx.sessions.clearModelPreference(
+      ctx.scope,
+      ctx.agent.id,
+      guard.expectedRevision,
+    );
+  } catch (err) {
+    if (isRevisionConflict(err)) {
+      await reply(ctx, STALE_CARD_REPLY);
+      return;
+    }
     cleared = null;
   }
   if (cleared === null) {
@@ -601,7 +632,8 @@ async function handleModelSubmit(
   ctx: CommandContext,
   revisionArg: string | undefined,
 ): Promise<void> {
-  if (!(await guardModelMutation(ctx, revisionArg))) return;
+  const guard = await guardModelMutation(ctx, revisionArg);
+  if (!guard.ok) return;
   const formValue = ctx.formValue ?? {};
   const manual = String(formValue.manual_model ?? '').trim();
   const selected = String(formValue.model ?? '').trim();
@@ -617,13 +649,21 @@ async function handleModelSubmit(
     await reply(ctx, `❌ ${validation.reason}`);
     return;
   }
-  await applyModel(ctx, validation.modelId);
+  await applyModel(ctx, validation.modelId, guard.expectedRevision);
 }
 
-async function applyModel(ctx: CommandContext, modelId: string): Promise<void> {
+async function applyModel(
+  ctx: CommandContext,
+  modelId: string,
+  expectedRevision?: number,
+): Promise<void> {
   try {
-    await ctx.sessions.setModelPreference(ctx.scope, ctx.agent.id, modelId);
-  } catch {
+    await ctx.sessions.setModelPreference(ctx.scope, ctx.agent.id, modelId, expectedRevision);
+  } catch (err) {
+    if (isRevisionConflict(err)) {
+      await reply(ctx, STALE_CARD_REPLY);
+      return;
+    }
     await reply(ctx, '❌ 保存失败，已保留原模型设置。');
     return;
   }
@@ -644,7 +684,7 @@ async function sendModelCard(ctx: CommandContext, forceRefresh: boolean): Promis
   const card = modelSelectCard({
     agentName: ctx.agent.displayName,
     scopeLabel: modelScopeLabel(ctx.chatMode),
-    current: { value: pref?.model, source: pref ? 'override' : 'cli' },
+    current: modelSelection(pref),
     catalog,
     revision: ctx.sessions.getModelRevision(ctx.scope),
     canManage,
@@ -660,10 +700,13 @@ async function handleModelListText(ctx: CommandContext): Promise<void> {
     `当前选择：${pref ? pref.model : '跟随 CLI 设置'}`,
     catalog.note,
   ];
+  if (catalog.status === 'stale') {
+    head.push(`上次更新：${formatModelTime(catalog.fetchedAt)}`);
+  }
   const body =
     catalog.candidates.length > 0
       ? catalog.candidates
-          .slice(0, 40)
+          .slice(0, MAX_TEXT_CANDIDATES)
           .map((c) => `• ${c.id}${c.displayName !== c.id ? ` — ${c.displayName}` : ''}`)
           .join('\n')
       : '_（无候选，可用 `/model <模型 ID>` 手动指定）_';
@@ -1085,10 +1128,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
-    model: {
-      value: modelPref?.model,
-      source: modelPref ? 'override' : 'cli',
-    },
+    model: modelSelection(modelPref),
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }

@@ -108,6 +108,19 @@ describe('/status and /doctor diagnostics', () => {
     expect(status).not.toContain('工作目录已选择');
   });
 
+  it('submits the doctor probe without a chat model override (OPT-07 rule)', async () => {
+    // /doctor uses its own diagnostic scope and must NOT inherit a chat
+    // /model preference — a bad model override must not break diagnostics.
+    const h = await createHarness({ configuredWorkspace: true });
+    await h.sessions.setModelPreference('chat-1', 'claude', 'broken-model-override');
+    await h.sessions.flush();
+
+    await expect(h.run('/doctor')).resolves.toBe(true);
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.model).toBeUndefined();
+  });
+
   it('fast-fails the agent echo check when the process pool is full', async () => {
     const h = await createHarness({ configuredWorkspace: true });
     const release = await h.pool.acquire();

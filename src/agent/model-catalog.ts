@@ -18,7 +18,14 @@ import { discoverClaudeModels } from './claude/models';
  */
 
 export type ModelSource = 'cli' | 'help' | 'static';
-export type ModelCatalogStatus = 'ok' | 'failed' | 'static';
+/** `stale`: discovery failed but a previously fetched list is still shown
+ * (spec interaction table: 失败保留旧列表并显示来源时间). */
+export type ModelCatalogStatus = 'ok' | 'failed' | 'static' | 'stale';
+
+/** Upper bound for a model id everywhere it is handled as a value: argv
+ * element, manual input, card option value. Card *display* labels have their
+ * own tighter budgets (see model-card). */
+export const MODEL_ID_MAX_LEN = 120;
 
 export interface ModelCandidate {
   /** Value passed to `--model`. */
@@ -103,11 +110,18 @@ export async function discoverModelCatalog(
     result = failureResult(input.capability.agentId, now());
   }
 
-  // Only a fresh success replaces the cache; a failure lets the caller keep
-  // showing the last good list (handled above via cache hit before discovery).
-  if (result.status !== 'failed') {
-    cache.set(key, { result, expiresAt: now() + CACHE_TTL_MS });
+  if (result.status === 'failed') {
+    // 失败保留旧列表：serve the last good list (even past its TTL) instead of
+    // an empty failure. fetchedAt stays the ORIGINAL fetch time so the UI can
+    // show where the list came from; the cache entry itself is left untouched
+    // so a later success replaces it normally.
+    const lastGood = cache.get(key);
+    if (lastGood) return staleResult(lastGood.result);
+    return result;
   }
+
+  // Only a fresh success replaces the cache.
+  cache.set(key, { result, expiresAt: now() + CACHE_TTL_MS });
   return result;
 }
 
@@ -134,10 +148,14 @@ async function discoverForAgent(
   if (capability.agentId === 'codebuddy') {
     return discoverCodeBuddyModels({
       ...provider,
-      binary: process.env.LARK_CHANNEL_CODEBUDDY_BIN ?? 'codebuddy',
+      binary: codebuddyBinary(),
     });
   }
   return discoverClaudeModels(provider);
+}
+
+function codebuddyBinary(): string {
+  return process.env.LARK_CHANNEL_CODEBUDDY_BIN ?? 'codebuddy';
 }
 
 function failureResult(agentId: string, now: number): ModelCatalogResult {
@@ -151,6 +169,17 @@ function failureResult(agentId: string, now: number): ModelCatalogResult {
   };
 }
 
+/** Re-present a previously fetched list after a failed refresh. The original
+ * fetchedAt is preserved (来源时间，由展示层渲染) and the result stays marked
+ * unverified. */
+function staleResult(lastGood: ModelCatalogResult): ModelCatalogResult {
+  return {
+    ...lastGood,
+    status: 'stale',
+    note: '刷新失败，以下为上次获取的候选列表（可能已过期）；可稍后重试或直接手动输入模型 ID。',
+  };
+}
+
 function cacheKey(input: DiscoverModelsInput): string {
   const { capability, profileConfig } = input;
   const app = profileConfig.accounts.app;
@@ -159,10 +188,9 @@ function cacheKey(input: DiscoverModelsInput): string {
 
 function agentBinary(profileConfig: ProfileConfig): string {
   if (profileConfig.agentKind === 'codex') return profileConfig.codex?.binaryPath ?? '';
-  if (profileConfig.agentKind === 'codebuddy') {
-    return process.env.LARK_CHANNEL_CODEBUDDY_BIN ?? 'codebuddy';
-  }
-  return process.env.LARK_CHANNEL_CLAUDE_BIN ?? 'claude';
+  if (profileConfig.agentKind === 'codebuddy') return codebuddyBinary();
+  // Claude discovery is static (never spawns), so any stable key will do.
+  return 'claude';
 }
 
 const defaultReadOnlyRunner: ReadOnlyRunner = (options) =>
@@ -185,8 +213,18 @@ const defaultReadOnlyRunner: ReadOnlyRunner = (options) =>
       return;
     }
 
-    const out = readAll(child.stdout as Readable);
-    const err = readAll(child.stderr as Readable);
+    if (!child.stdout || !child.stderr) {
+      resolve({
+        ok: false,
+        stdout: '',
+        stderr: 'spawned process has no piped stdio streams',
+        code: null,
+        timedOut: false,
+      });
+      return;
+    }
+    const out = readAll(child.stdout);
+    const err = readAll(child.stderr);
     let settled = false;
     const finish = (result: ReadOnlyExecResult): void => {
       if (settled) return;

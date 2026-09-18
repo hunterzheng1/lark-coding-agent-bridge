@@ -155,6 +155,19 @@ describe('comment run flow', () => {
     await Promise.all([first, second]);
   });
 
+  it('dispatches comment runs without a chat model override (OPT-07 rule)', async () => {
+    // Document comments run on their own scope and must not inherit a chat
+    // /model preference — first version keeps them on the CLI default.
+    const h = await createHarness();
+    await h.sessions.setModelPreference(docSessionScope('doc-token'), 'claude', 'chat-model-override');
+    await h.sessions.flush();
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(h.agent.runOptions[0]?.model).toBeUndefined();
+  });
+
   it('keeps replying when typing reaction add fails', async () => {
     const h = await createHarness({ reactionFails: true });
 

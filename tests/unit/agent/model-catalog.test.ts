@@ -201,6 +201,64 @@ describe('discoverModelCatalog — cache', () => {
   });
 });
 
+describe('discoverModelCatalog — stale fallback (失败保留旧列表)', () => {
+  const goodStdout = JSON.stringify({
+    models: [{ slug: 'm1', display_name: 'M1', visibility: 'show' }],
+  });
+
+  it('serves the last good list as stale when a later discovery fails past TTL', async () => {
+    clearModelCatalogCache();
+    let clock = 10_000;
+    let stdout = goodStdout;
+    let ok = true;
+    const input = {
+      capability: codexCapability(permProfile),
+      profileConfig: baseProfile(),
+      now: () => clock,
+      run: (async () => ({
+        ok,
+        stdout,
+        stderr: '',
+        code: ok ? 0 : 1,
+        timedOut: false,
+      })) as ReadOnlyRunner,
+    };
+    const first = await discoverModelCatalog(input);
+    expect(first.status).toBe('ok');
+    expect(first.fetchedAt).toBe(10_000);
+
+    clock += 10 * 60 * 1000; // TTL long expired
+    ok = false;
+    const stale = await discoverModelCatalog(input);
+    expect(stale.status).toBe('stale');
+    expect(stale.candidates.map((c) => c.id)).toEqual(['m1']);
+    // 来源时间 preserved from the ORIGINAL fetch, not the failed attempt.
+    expect(stale.fetchedAt).toBe(10_000);
+    expect(stale.unverified).toBe(true);
+    expect(stale.note).toContain('刷新失败');
+
+    // The failed attempt did not touch the cache: a later success is served
+    // fresh with a new fetch time.
+    ok = true;
+    clock += 1000;
+    const recovered = await discoverModelCatalog(input);
+    expect(recovered.status).toBe('ok');
+    expect(recovered.fetchedAt).toBe(clock);
+  });
+
+  it('keeps reporting a bare failure when no previous list exists', async () => {
+    clearModelCatalogCache();
+    const result = await discoverModelCatalog({
+      capability: codexCapability(permProfile),
+      profileConfig: baseProfile(),
+      now: () => 20_000,
+      run: async () => ({ ok: false, stdout: '', stderr: 'boom', code: 1, timedOut: false }),
+    });
+    expect(result.status).toBe('failed');
+    expect(result.candidates).toEqual([]);
+  });
+});
+
 describe('discoverModelCatalog — timeout', () => {
   it('marks a timed-out query as failed', async () => {
     clearModelCatalogCache();
