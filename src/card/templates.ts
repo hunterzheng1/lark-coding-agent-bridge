@@ -236,13 +236,26 @@ export function recoveryCard(input: {
       : '该消息在上次中断后滞留过久，未自动执行。';
   const preview =
     input.content.replace(/\s+/g, ' ').trim().slice(0, 120) || '(空内容)';
+  const buttons =
+    input.status === 'uncertain'
+      ? [
+          { text: '💬 继续对话', value: { cmd: 'inbound.continue', arg: input.messageId }, style: 'primary' as const },
+          { text: '♻️ 重头重做', value: { cmd: 'inbound.redo', arg: input.messageId } },
+          { text: '忽略', value: { cmd: 'inbound.dismiss', arg: input.messageId } },
+        ]
+      : [
+          { text: '▶️ 现在执行', value: { cmd: 'inbound.redo', arg: input.messageId }, style: 'primary' as const },
+          { text: '忽略', value: { cmd: 'inbound.dismiss', arg: input.messageId } },
+        ];
+  const hint =
+    input.status === 'uncertain'
+      ? '_继续对话 = 保留会话，agent 检查进度后接着做；重头重做 = 重置会话并完整重跑。_'
+      : '_现在执行 = 按原内容正常派发。_';
   return shell('⚠️ 上次中断恢复', [
     divMd(statusLine),
     divMd(`任务内容：${preview}`),
     HR,
-    actions([
-      { text: '🔁 重做任务', value: { cmd: 'inbound.redo', arg: input.messageId }, style: 'primary' },
-      { text: '忽略', value: { cmd: 'inbound.dismiss', arg: input.messageId } },
-    ]),
+    actions(buttons),
+    divMd(hint),
   ]);
 }

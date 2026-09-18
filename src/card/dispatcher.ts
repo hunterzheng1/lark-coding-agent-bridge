@@ -1,7 +1,8 @@
 import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
-import type { ChatModeCache } from '../bot/chat-mode-cache';
+import type { ChatMode, ChatModeCache } from '../bot/chat-mode-cache';
+import type { AccessDecision } from '../policy/access';
 import type { InboundJournal } from '../bot/inbound-journal';
 import { recoveryMessageFrom } from '../bot/inbound-journal';
 import type { PendingQueue } from '../bot/pending-queue';
@@ -10,12 +11,12 @@ import type { CallbackAuth } from './callback-auth';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
 import { log } from '../core/logger';
 import { canUseDm, canUseGroup } from '../policy/access';
+import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
 import type { SessionStore } from '../session/store';
 import type { ThinkingHistoryStore } from '../session/thinking-history';
 import type { WorkspaceStore } from '../workspace/store';
-import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import { lookupMessageThreadId } from '../bot/thread-id';
 
 /** Marker key on a button's value object that flags the cardAction as
@@ -92,9 +93,22 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     // Recovery-card actions (OPT-04) need the pending queue, which command
     // handlers don't hold — handle them right here. Unsigned like other
     // built-in command buttons; chat/user access was already enforced above.
-    if (cmd === 'inbound.redo' || cmd === 'inbound.dismiss') {
+    if (
+      cmd === 'inbound.redo' ||
+      cmd === 'inbound.continue' ||
+      cmd === 'inbound.dismiss'
+    ) {
       const messageId = typeof payload.arg === 'string' ? payload.arg : '';
-      await handleInboundRecoveryAction(deps, scope, chatId, cmd, messageId);
+      await handleInboundRecoveryAction(deps, {
+        scope,
+        chatId,
+        threadId,
+        mode,
+        msg: makeFakeMsg(deps.evt, threadId),
+        access: accessDecision,
+        cmd,
+        messageId,
+      });
       return;
     }
     if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
@@ -156,68 +170,130 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   return;
 }
 
+/** Continuation prompt sent by 继续对话 — bridge-generated wrapper, clearly marked. */
+function continuationPrompt(content: string): string {
+  return [
+    '【恢复】上次运行被中断，执行结果未知。',
+    '请先检查工作区中的已有进度（已修改的文件、未完成的步骤），从中断处继续完成任务，不要重复已完成的工作。',
+    '',
+    `原任务：${content}`,
+  ].join('\n');
+}
+
 /**
- * Recovery-card button actions (OPT-04 分片 4). `inbound.redo` settles the
- * journal record and re-dispatches its content through the normal pending →
- * run flow under a fresh message id (fresh policy checks at dispatch);
- * `inbound.dismiss` settles it without running. Both are idempotent — a
- * second click on a settled record only answers "已处理过".
+ * Recovery-card button actions (OPT-04 分片 4):
+ * - `inbound.continue`（继续对话）: keep the session, dispatch a continuation
+ *   prompt so the agent inspects progress and picks up where things stand.
+ * - `inbound.redo`: uncertain → reset the scope session (archive the catalog
+ *   entry + clear the session store, same as /new) and re-dispatch the
+ *   original task from scratch; expired (never dispatched) → just dispatch
+ *   the original content into the current session, no reset.
+ * - `inbound.dismiss`: settle without running.
+ * All are idempotent — a second click on a settled record answers 已处理过.
  */
 async function handleInboundRecoveryAction(
   deps: CardDispatchDeps,
-  scope: string,
-  chatId: string,
-  cmd: string,
-  messageId: string,
+  input: {
+    scope: string;
+    chatId: string;
+    threadId: string | undefined;
+    mode: ChatMode;
+    msg: NormalizedMessage;
+    access: AccessDecision;
+    cmd: string;
+    messageId: string;
+  },
 ): Promise<void> {
   const journal = deps.inboundJournal;
   const send = (markdown: string): void => {
-    void deps.channel.send(chatId, { markdown }).catch((err) => log.fail('inbound', err));
+    void deps.channel.send(input.chatId, { markdown }).catch((err) => log.fail('inbound', err));
   };
-  if (!journal || !messageId) {
+  if (!journal || !input.messageId) {
     send('恢复记录不可用（journal 未启用或缺少消息 id）。');
     return;
   }
-  const record = journal.getRecord(scope, messageId);
-  const actionable =
-    record && (record.status === 'uncertain' || record.status === 'expired');
-  if (!record || !actionable) {
+  const record = journal.getRecord(input.scope, input.messageId);
+  if (!record || (record.status !== 'uncertain' && record.status !== 'expired')) {
     send('该恢复记录已处理过。');
     return;
   }
 
-  if (cmd === 'inbound.dismiss') {
-    await journal.markDismissed(scope, messageId);
-    log.info('inbound', 'recovery-dismiss', { scope, messageId });
+  if (input.cmd === 'inbound.dismiss') {
+    await journal.markDismissed(input.scope, input.messageId);
+    log.info('inbound', 'recovery-dismiss', { scope: input.scope, messageId: input.messageId });
     send('✓ 已忽略该恢复记录。');
     return;
   }
 
-  // inbound.redo
-  const newId = await journal.redo(scope, messageId);
-  if (!newId) {
-    send('该恢复记录已处理过。');
+  const dispatch = async (content: string): Promise<void> => {
+    const newId = await journal.redo(input.scope, input.messageId, content);
+    if (!newId) {
+      send('该恢复记录已处理过。');
+      return;
+    }
+    const m = recoveryMessageFrom(record, newId);
+    const synthetic: NormalizedMessage = {
+      messageId: m.messageId,
+      chatId: m.chatId,
+      chatType: m.chatType === 'p2p' ? 'p2p' : 'group',
+      ...(m.threadId ? { threadId: m.threadId } : {}),
+      senderId: m.senderId,
+      senderName: undefined,
+      content,
+      rawContentType: 'text',
+      resources: [],
+      mentions: [],
+      mentionAll: false,
+      mentionedBot: true,
+      createTime: Date.now(),
+    } as unknown as NormalizedMessage;
+    deps.pending.push(input.scope, synthetic);
+    log.info('inbound', 'recovery-redo', {
+      scope: input.scope,
+      messageId: input.messageId,
+      newMessageId: newId,
+      action: input.cmd,
+    });
+  };
+
+  if (input.cmd === 'inbound.continue') {
+    // 继续对话: keep the session. For an expired record (never dispatched)
+    // there is nothing to continue — degrade to a plain dispatch.
+    const content =
+      record.status === 'uncertain' ? continuationPrompt(record.content) : record.content;
+    await dispatch(content);
+    send(
+      record.status === 'uncertain'
+        ? '💬 已在原会话提交继续请求，agent 会先检查进度再接着做。'
+        : '▶️ 该记录未曾执行，已直接提交执行。',
+    );
     return;
   }
-  const m = recoveryMessageFrom(record, newId);
-  const synthetic: NormalizedMessage = {
-    messageId: m.messageId,
-    chatId: m.chatId,
-    chatType: m.chatType === 'p2p' ? 'p2p' : 'group',
-    ...(m.threadId ? { threadId: m.threadId } : {}),
-    senderId: m.senderId,
-    senderName: undefined,
-    content: m.content,
-    rawContentType: 'text',
-    resources: [],
-    mentions: [],
-    mentionAll: false,
-    mentionedBot: true,
-    createTime: Date.now(),
-  } as unknown as NormalizedMessage;
-  deps.pending.push(scope, synthetic);
-  log.info('inbound', 'recovery-redo', { scope, messageId, newMessageId: newId });
-  send('🔁 已重新提交任务，按新消息处理。');
+
+  // inbound.redo
+  if (record.status === 'uncertain') {
+    // Full redo: reset the scope session (catalog entry + session store,
+    // same as /new) so the re-run cannot resume the interrupted context.
+    const identity = await commandSessionCatalogIdentity({
+      msg: input.msg,
+      scope: input.scope,
+      mode: input.mode,
+      workspaces: deps.workspaces,
+      controls: deps.controls,
+      access: input.access,
+    });
+    if (identity) {
+      deps.sessionCatalog?.archiveActive({ ...identity, now: Date.now() });
+    }
+    deps.sessions.clear(input.scope);
+    await dispatch(record.content);
+    send('♻️ 已重置会话并重新提交完整任务，后续消息将在新会话中处理。');
+    return;
+  }
+
+  // expired: nothing ever ran — plain dispatch into the current session.
+  await dispatch(record.content);
+  send('▶️ 已按原内容提交执行。');
 }
 
 async function resolveScope(

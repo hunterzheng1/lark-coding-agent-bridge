@@ -200,13 +200,19 @@ export class InboundJournal {
   }
 
   /**
-   * Recovery-card "重做" (OPT-04): settle the old uncertain/expired record as
-   * `redone` and journal a fresh queued copy under a derived id, so the
-   * re-dispatched message runs through the normal claim → terminal
-   * lifecycle (with fresh policy checks at dispatch). Resolves the new
-   * messageId, or undefined when the record is missing/already settled.
+   * Recovery-card actions (OPT-04): settle the old uncertain/expired record
+   * as `redone` and journal a fresh queued copy, so the re-dispatched message
+   * runs through the normal claim → terminal lifecycle (with fresh policy
+   * checks at dispatch). `contentOverride` replaces the dispatched content —
+   * used by 继续对话 to send a continuation prompt instead of the raw task.
+   * Resolves the new messageId, or undefined when the record is
+   * missing/already settled.
    */
-  async redo(scope: string, messageId: string): Promise<string | undefined> {
+  async redo(
+    scope: string,
+    messageId: string,
+    contentOverride?: string,
+  ): Promise<string | undefined> {
     const record = this.records.get(key(scope, messageId));
     if (!record) return undefined;
     if (record.status !== 'uncertain' && record.status !== 'expired') return undefined;
@@ -219,7 +225,7 @@ export class InboundJournal {
       scope: record.scope,
       chatId: record.chatId,
       senderId: record.senderId,
-      content: record.content,
+      content: contentOverride ?? record.content,
       acceptedAt: this.now(),
       status: 'queued',
       ...(record.threadId ? { threadId: record.threadId } : {}),

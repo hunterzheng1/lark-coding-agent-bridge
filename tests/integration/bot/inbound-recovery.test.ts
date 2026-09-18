@@ -178,8 +178,9 @@ describe('inbound journal end-to-end (OPT-04)', () => {
       () => h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
       6000,
     );
-    // The recovery notice is a structured card with redo/dismiss actions.
+    // The recovery notice is a structured card with continue/redo/dismiss actions.
     const card = h.channel.sent.find((s) => JSON.stringify(s.content).includes('未自动重跑'));
+    expect(JSON.stringify(card)).toContain('inbound.continue');
     expect(JSON.stringify(card)).toContain('inbound.redo');
     expect(JSON.stringify(card)).toContain('inbound.dismiss');
     expect(JSON.stringify(card)).toContain('om_side_effect');

@@ -182,6 +182,97 @@ describe('recovery card actions (inbound.redo / inbound.dismiss)', () => {
   });
 });
 
+
+describe('recovery card 继续对话 vs 重头重做 split', () => {
+  async function seedWithSession(h: Harness): Promise<void> {
+    await h.journal.recordAccepted({
+      messageId: 'om_unc',
+      scope: 'oc_group',
+      chatId: 'oc_group',
+      senderId: 'ou_operator',
+      content: 'original task text',
+      acceptedAt: Date.now(),
+      chatType: 'group',
+    });
+    await h.journal.markClaimed('oc_group', ['om_unc'], 'run-lost');
+    await h.journal.recoverOnStartup();
+    // A resumable session exists before the recovery action.
+    h.sessions.set('oc_group', 'sess-live', 'C:/cwd');
+  }
+
+  it('继续对话 keeps the session and dispatches a continuation prompt', async () => {
+    const h = await createHarness();
+    await seedWithSession(h);
+
+    await h.dispatch({ cmd: 'inbound.continue', arg: 'om_unc' });
+
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.content).toContain('【恢复】');
+    expect(queued[0]?.content).toContain('original task text');
+    // Session is preserved.
+    expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-live');
+    const old = h.journal.getRecord('oc_group', 'om_unc');
+    expect(old?.terminalState).toBe('redone');
+  });
+
+  it('重头重做 resets the session and dispatches the original text', async () => {
+    const h = await createHarness();
+    await seedWithSession(h);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_unc' });
+
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.content).toBe('original task text');
+    // Session was reset — the re-run cannot resume the interrupted context.
+    expect(h.sessions.getRaw('oc_group')?.sessionId).toBeUndefined();
+  });
+
+  it('expired record: redo dispatches plainly without touching the session', async () => {
+    const h = await createHarness();
+    await h.journal.recordAccepted({
+      messageId: 'om_old',
+      scope: 'oc_group',
+      chatId: 'oc_group',
+      senderId: 'ou_operator',
+      content: 'never dispatched task',
+      acceptedAt: Date.now() - 60 * 60_000,
+      chatType: 'group',
+    });
+    await h.journal.recoverOnStartup(); // → expired
+    h.sessions.set('oc_group', 'sess-keep', 'C:/cwd');
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_old' });
+
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.content).toBe('never dispatched task');
+    expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-keep');
+  });
+
+  it('continue on an expired record degrades to a plain dispatch', async () => {
+    const h = await createHarness();
+    await h.journal.recordAccepted({
+      messageId: 'om_old2',
+      scope: 'oc_group',
+      chatId: 'oc_group',
+      senderId: 'ou_operator',
+      content: 'never started task',
+      acceptedAt: Date.now() - 60 * 60_000,
+      chatType: 'group',
+    });
+    await h.journal.recoverOnStartup();
+
+    await h.dispatch({ cmd: 'inbound.continue', arg: 'om_old2' });
+
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.content).toBe('never started task');
+    expect(JSON.stringify(h.channel.sent)).toContain('未曾执行');
+  });
+});
+
 type Harness = {
   tmp: TmpProfile;
   channel: FakeChannel;

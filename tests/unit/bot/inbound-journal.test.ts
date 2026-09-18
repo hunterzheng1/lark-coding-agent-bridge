@@ -180,3 +180,18 @@ describe('InboundJournal recovery actions (recovery card)', () => {
     expect(await j.redo('oc_chat1', 'om_nope')).toBeUndefined();
   });
 });
+
+describe('InboundJournal redo contentOverride (继续对话)', () => {
+  it('override replaces the dispatched content in the fresh record', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_c' }));
+    await j.markClaimed('oc_chat1', ['om_c'], 'run-x');
+    await j.recoverOnStartup();
+    const newId = await j.redo('oc_chat1', 'om_c', '【恢复】继续');
+    const fresh = j.getRecord('oc_chat1', newId!);
+    expect(fresh?.content).toBe('【恢复】继续');
+    // Old record keeps its original content for audit.
+    expect(j.getRecord('oc_chat1', 'om_c')?.content).toBe('请帮我跑测试');
+  });
+});
