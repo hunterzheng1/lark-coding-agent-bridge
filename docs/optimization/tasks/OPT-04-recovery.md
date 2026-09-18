@@ -87,6 +87,10 @@
 3. **停机生命周期跟踪再前置**：批次 Promise（模式解析→媒体/引用→策略→spawn→流→终态）此前只在 `processAgentStream` 创建处登记，disconnect 落在该死区时排空集合为空、flush 提前。现 PendingQueue 回调创建完整批次 Promise 即 `trackSettle`。新增 e2e：批次停在 spawn 前认领时断连，`disconnect` 返回即记录已落 terminal/rejected。
 4. **reservation 回滚加对象同一性守卫**：`recordAccepted` 首写失败的无条件 `records.delete(k)` 可能删除写入期间被 `/new` 清空后以同 id 重建的新记录。现仅在 `records.get(k) === 本次 reservation` 时删除。新增替换场景单测。
 
+### 评审五轮修复（2026-09-18）
+
+1. **停机改为「显式取消 + 等真正落定」，废除固定 3s 排空上限**：四轮方案的 `disconnect` 有界排空（3s/100ms 轮询）只是把风险窗口挪了位置——媒体解析、引用获取、话题上下文等 spawn 前网络等待完全可能超 3s，超时后仍会 flush 并返回，进程退出即丢失该批次的后续状态写入。现 `startChannel` 持有 `shutdown: AbortController`，`disconnect` 在 `cancelAll` 后立即 `abort()`；新增 `raceShutdown(signal, label, promise)` 竞态辅助，包装全部 **spawn 前** 上游等待（chat 模式解析、`media.resolve`、`fetchQuotedContext` 循环、prompt 内 `fetchTopicContext`），并在 `startRunFlow` 前加同步 abort 守卫。被取消的批次从未 spawn，其 journal 记录保持 queued（本地认领/终态写入不参与竞态、必被等待），下次启动按「从未派发」语义安全重放。排空截止改为 `agentStopGraceMs + 10s`，仅作病态兜底（如卡死的本地写入），触发时 `log.warn('disconnect','drain-timeout')` 显式告警而非静默提前 flush。新增受控测试：门控认领停 4.2s（超旧 3s 上限）→ `disconnect` 实际等待至记录落 terminal/rejected 才返回；`fetchRawMessage` 无限挂起 → abort 后 `disconnect` 立即返回、记录保持 queued 且无运行。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
