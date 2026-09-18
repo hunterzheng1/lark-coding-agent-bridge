@@ -1,6 +1,6 @@
 # OPT-07：会话模型选择
 
-日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）、Slice B（选择卡与目录发现）、Slice C（忙时切换与恢复一致性）均已实施并本地验证通过（各轮 `pnpm ci:local` 全绿）；现场/真机验证仍未执行。以下交互、权限和一致性规则属于设计建议，实施取舍见文末三段「实施记录」。
+日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）、Slice B（选择卡与目录发现）、Slice C（忙时切换与恢复一致性）均已实施并本地验证通过（各轮 `pnpm ci:local` 全绿）；随后完成一轮独立评审修复（见文末「实施记录：评审修复」），修复后 `pnpm ci:local` 全绿（868 测试）；现场/真机验证仍未执行。以下交互、权限和一致性规则属于设计建议，实施取舍见文末各段「实施记录」。
 
 ## 目标与结论
 
@@ -235,3 +235,30 @@
 - 命令层忙时切换现为允许：`tests/integration/commands/model-command.test.ts`。
 
 OPT-04 的 claim/terminal/uncertain/停机跟踪等既有用例在本轮全量回归中保持全绿。
+
+## 实施记录：评审修复（2026-09-18，基线 `b2b5793` 之后）
+
+独立双轴评审（Standards/Spec 子代理 + 本机 `pnpm ci:local` 复验）指出若干缺口，本轮全部修复；修复后 `pnpm ci:local` 全绿（115 个测试文件、868 测试，较 Slice C 净增 15 项）。现场/真机验证仍未执行。
+
+### Spec 轴修复
+
+- 「失败保留旧列表并显示来源时间」（推荐交互表）真实落地：`discoverModelCatalog` 失败（抛错或 failed 结果）时若存在上次成功结果，改以新增 `status='stale'` 返回旧列表，保留原 `fetchedAt`（来源时间由展示层渲染），不触碰缓存条目（后续成功仍正常替换）。选择卡对 stale 显示「⚠️ note · 上次更新 <时间>」且旧候选仍可选；`/model list` 文本补「上次更新」行。Slice B 记录中「查询失败不清缓存（保留上次好值）」的声明自本轮起与实际行为一致（此前过期条目保留但永不服务，属夸大）。无历史列表时仍返回空候选 failed 态，不虚构。
+- 命令/文档评论入口规则测试补齐（Slice A 遗留）：`/doctor` 在 scope 已设聊天模型覆盖时探测仍不携带 model（doctor-status 测试）；文档评论运行不继承聊天偏好（comment-run-flow 测试）。
+- revision 提交时校验（TOCTOU 修复）：`setModelPreference`/`clearModelPreference` 新增 `expectedRevision` 乐观参数，提交时（而非仅 guard 读取时）核对 revision，不匹配抛 `ModelRevisionConflictError` 且不产生任何写入；命令层 guard 透传卡片绑定 revision，冲突回复与 guard 一致的「已过期」文案。并发双卡同 revision 提交现在恰好一胜一拒（集成测试）。
+- Scope 隔离测试补齐：Profile（独立 sessions 文件互不可见）与普通群/话题 scope 的模型层直接测试。
+- 无 journal 回退路径的快照语义：intake 现将接受时冻结的模型快照同步写入按消息对象的 WeakMap sidecar，flush 分组在无 journal 时按消息各自的 intake 快照取值（原实现整批读一次 flush 时实时偏好）。生产始终创建 journal，此修复面向未来调用方的语义一致性。
+
+### Standards 轴修复（判断性建议）
+
+- `escapeMd` 三份私有拷贝收敛为 `src/card/markdown.ts` 单一实现（templates/model-card 引用）。
+- `{ value?, source: 'override'|'cli' }` 数据团具名为 `ModelSelection`（model-card 导出），`modelSelection(pref)` 工厂统一 `/status` 卡与选择卡的构造。
+- `LARK_CHANNEL_CODEBUDDY_BIN` 重复读取收敛为单一 `codebuddyBinary()`；`agentBinary` 的 claude 分支不再读取从未使用的 `LARK_CHANNEL_CLAUDE_BIN`（Claude 发现为静态、不 spawn）。
+- 移除 `child.stdout as Readable` unsound cast（`defaultReadOnlyRunner` 显式判空）。
+- 模型 ID 上限统一为 `model-catalog.ts` 导出的 `MODEL_ID_MAX_LEN`（命令层与卡片共用）；文本列表上限具名 `MAX_TEXT_CANDIDATES = 40` 并注明与卡片预算（30）属不同约束。
+- 偏好写入按 store 串行化（`prefWrites` 链）：失败回滚发生在后续写入读取 prev 之前，消除「回滚覆盖并发成功写入」竞态；受控故障注入测试（mock atomic-write）覆盖回滚不吞噬后续成功写、冲突零写入、落盘成功才回执。
+
+### 未改动项（有意保留）
+
+- `tryHandleCommand` 布尔返回值 + `commandKeepsPendingQueue` 侧通道（Slice A 已声明的边界）。
+- revision 为 per-scope 而非 per scope+agent：跨 agent 卡片互失效属保守方向，保留。
+- Slice C 记录中「最近使用、跨 Agent 选择、推理强度/预设、恢复卡『用当前模型重做』」仍为后续能力；候选账号可用性、续接覆盖、飞书移动端交互仍需现场验证。
