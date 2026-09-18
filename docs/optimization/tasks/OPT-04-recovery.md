@@ -106,6 +106,12 @@
 1. **cardAction / comment 纳入排空集合并设持久化/派发闸（P1）**：七轮只给两者加了入口拒绝闸，停机前**已进入**的回调仍未登记——回调若正停在异步操作（`resolveScope` 的 chat-mode/thread lookup、评论的目标解析与上下文拉取）中，disconnect 可能看到空排空集合并返回，回调恢复后照常写 journal、`pending.push`、发消息甚至创建/恢复 Agent 运行。现：两个 handler 与 message handler 同构，从入口 `trackSettle`；`shutdownSignal` 下传给 `handleCardAction` 与 `handleCommentMention`，在回调首个 await（`resolveScope`）之后设第一道闸（`cardAction.dropped-by-shutdown`），恢复卡动作的 `journal.redo`+`pending.push` 前设第二道闸（`inbound.recovery-dispatch-skipped-by-shutdown`，静默不派发）；评论在 `executor.submit` 派发前设闸（`comment.dispatch-skipped-by-shutdown`）。已登记闸内恢复后的反馈文本发送由 fire-and-forget 改为 await，全部落在被跟踪的回调生命周期内。
 2. **恢复通知纳入生命周期（P2）**：启动恢复任务对 uncertain/expired 卡片仍是 `void channel.send(...)`——外层任务在通知发出前就从 pendingSettles 移除，disconnect 可以完成而旧实例仍持有发送中的卡片。现每条恢复通知在已跟踪的恢复任务内 `await`（每轮循环前检查停机状态可提前 `startup-recovery-cancelled`），发送完成前 disconnect 不会返回。新增测试：恢复通知停在被门控的 `channel.send` 时断连 → disconnect 等待通知落定（≥800ms）且断连后卡片已完整发出；cardAction 停在 `getChatMode` 门控时断连 → disconnect 等待该回调恢复（≥800ms），恢复后的点击被停机闸拦截——不写 redo、不产生新记录、不派发、无成功文案，记录仍为 uncertain 待下次处理。
 
+### 评审九轮修复（2026-09-18）
+
+1. **journal.redo 完成后的第二道派发闸（P1）**：八轮的恢复卡闸门只设在 `journal.redo()` 之前；若 disconnect 恰在 redo 持久化 await 期间开始（`cancelAll`+`abort` 已执行、前置闸已过），redo 完成后仍会 `pending.push`，在即将返回的旧实例上重建 600ms 合批定时器。现在 `redo()` 返回、`pending.push` 之前再查一次 `shutdownSignal`（记 `inbound.recovery-push-skipped-by-shutdown`）并静默跳过——已持久化的新记录保持 queued（从未派发 → 下次启动重放），旧记录照常落 terminal/redone。
+2. **内置卡片命令执行前的停机闸（P2）**：`cmd` 分支在 `await commandSessionCatalogIdentity(...)` 之后未再检查停机就直接 `runCommandHandler`，等待期间开始停机时 /new、workspace、restart 等命令副作用仍可能跨界执行。现于命令交接前设闸（记 `cardAction.command-skipped-by-shutdown`）。
+3. **测试**：新增 `GatedRedoJournal`（redo 可停在持久化中途）——断连发生在 redo 期间 → disconnect 等待被跟踪回调落定（≥800ms），第二道闸生效：新记录以 queued 落盘、旧记录 terminal、合批窗口过后 0 次运行、无成功文案。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
