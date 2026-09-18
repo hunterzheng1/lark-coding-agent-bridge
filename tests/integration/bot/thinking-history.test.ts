@@ -8,6 +8,7 @@ import type { AgentEvent } from '../../../src/agent/types';
 import { SessionStore } from '../../../src/session/store.js';
 import { ThinkingHistoryStore } from '../../../src/session/thinking-history.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
+import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
 import { createTmpProfile } from '../../helpers/tmp-profile.js';
@@ -139,7 +140,7 @@ async function runCommand(
     sessions: new SessionStore(join(h.profileDir, 'sessions.json')),
     workspaces: new WorkspaceStore(join(h.profileDir, 'workspaces.json')),
     agent: { displayName: 'Claude Code' } as never,
-    activeRuns: {} as CommandContext['activeRuns'],
+    activeRuns: new ActiveRuns(),
     controls: createControls(h.profileConfig),
     thinkingHistory: h.history,
   });

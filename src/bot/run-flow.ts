@@ -1,6 +1,7 @@
 import type { AgentCapability } from '../agent/capability';
 import type { AgentEvent } from '../agent/types';
 import type { ProfileConfig } from '../config/profile-schema';
+import { log } from '../core/logger';
 import type { AccessDecision } from '../policy/access';
 import {
   evaluateRunPolicy,
@@ -36,6 +37,17 @@ export interface StartRunFlowInput {
   executor: RunExecutor;
   now: number;
   stopGraceMs?: number;
+  /**
+   * OPT-04: called after policy approval, immediately before executor.submit.
+   * Throw to abort the run before any agent spawns — used by the inbound
+   * journal to claim the batch atomically; if the claim cannot be persisted,
+   * the agent must not start (a crash would otherwise replay an already-run
+   * task).
+   */
+  beforeSpawn?: (context: {
+    policyFingerprint: string;
+    cwdRealpath: string;
+  }) => Promise<void>;
   observability?: {
     profile: string;
     agent: string;
@@ -53,7 +65,8 @@ export interface RunPromptContext {
 export type RunFlowRejectCode =
   | WorkingDirectoryRejectReason
   | RunPolicyReject['rejectReason']['code']
-  | RunRejectedCode;
+  | RunRejectedCode
+  | 'journal-claim-failed';
 
 export type StartRunFlowResult =
   | {
@@ -160,6 +173,28 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
           ...(resumeFrom ? { resumeFrom } : {}),
         });
   const effectivePolicy: RunPolicyAllow = { ...policy, prompt };
+
+  if (input.beforeSpawn) {
+    try {
+      await input.beforeSpawn({
+        policyFingerprint: policy.policyFingerprint,
+        cwdRealpath: workspace.cwdRealpath,
+      });
+    } catch (err) {
+      log.warn('run', 'before-spawn-claim-failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        ok: false,
+        rejectReason: {
+          code: 'journal-claim-failed',
+          userVisible:
+            '⚠️ 任务恢复记录暂时无法写入，为避免重复执行已取消本次启动。请稍后重试。',
+        },
+        workspace,
+      };
+    }
+  }
 
   let execution: RunExecution;
   try {

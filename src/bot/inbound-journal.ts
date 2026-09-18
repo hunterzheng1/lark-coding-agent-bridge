@@ -133,20 +133,52 @@ export class InboundJournal {
     return (await this.persistScope(input.scope)) ? 'recorded' : 'failed';
   }
 
-  async markClaimed(scope: string, messageIds: readonly string[], runId: string): Promise<void> {
+  async markClaimed(
+    scope: string,
+    messageIds: readonly string[],
+    runId: string,
+  ): Promise<boolean> {
+    const now = this.now();
     let touched = false;
     for (const messageId of messageIds) {
       const record = this.records.get(key(scope, messageId));
-      if (!record || record.status !== 'queued') continue;
-      record.status = 'claimed';
-      record.runId = runId;
-      record.claimedAt = this.now();
-      touched = true;
+      // A missing record means the message was never durably accepted (e.g.
+      // the journal is unwritable) — the run must not start, or a crash
+      // could replay a task whose side effects already happened.
+      if (!record) return false;
+      if (record.status === 'queued') {
+        record.status = 'claimed';
+        record.runId = runId;
+        record.claimedAt = now;
+        touched = true;
+      } else if (record.status !== 'claimed' && record.status !== 'terminal') {
+        // uncertain/expired records must not be claimed by dispatch.
+        return false;
+      }
     }
-    if (touched) await this.persistScope(scope);
+    if (!touched) return true;
+    return this.persistScope(scope);
   }
 
-  async markTerminal(scope: string, runId: string, terminal: string): Promise<void> {
+  /**
+   * Re-bind claimed records from the provisional pre-spawn claim id to the
+   * real run id after the executor accepted the run. Failure is safe in the
+   * conservative direction: the record stays claimed (→ uncertain on
+   * restart, never auto-rerun), it must just be reported.
+   */
+  async bindRun(scope: string, messageIds: readonly string[], runId: string): Promise<boolean> {
+    let touched = false;
+    for (const messageId of messageIds) {
+      const record = this.records.get(key(scope, messageId));
+      if (!record || record.status !== 'claimed') continue;
+      record.runId = runId;
+      touched = true;
+    }
+    if (!touched) return true;
+    return this.persistScope(scope);
+  }
+
+  async markTerminal(scope: string, runId: string, terminal: string): Promise<boolean> {
     const now = this.now();
     let touched = false;
     for (const record of this.records.values()) {
@@ -156,25 +188,30 @@ export class InboundJournal {
       record.terminalState = terminal;
       touched = true;
     }
-    if (touched) await this.persistScope(scope);
+    if (!touched) return true;
+    return this.persistScope(scope);
   }
 
   /**
-   * Settle queued records whose intake was rejected (policy denial etc.) so a
-   * restart does not replay them into the same rejection.
+   * Settle records whose intake was rejected (policy denial, submit refusal)
+   * so a restart does not replay them into the same rejection. Covers both
+   * queued (rejected before spawn) and claimed (claim persisted but the
+   * executor refused — no agent ever started).
    */
-  async markRejected(scope: string, messageIds: readonly string[]): Promise<void> {
+  async markRejected(scope: string, messageIds: readonly string[]): Promise<boolean> {
     const now = this.now();
     let touched = false;
     for (const messageId of messageIds) {
       const record = this.records.get(key(scope, messageId));
-      if (!record || record.status !== 'queued') continue;
+      if (!record) continue;
+      if (record.status !== 'queued' && record.status !== 'claimed') continue;
       record.status = 'terminal';
       record.settledAt = now;
       record.terminalState = 'rejected';
       touched = true;
     }
-    if (touched) await this.persistScope(scope);
+    if (!touched) return true;
+    return this.persistScope(scope);
   }
 
   /** /new semantics: drop queued (never-dispatched) records for the scope. */
@@ -211,7 +248,7 @@ export class InboundJournal {
   async redo(
     scope: string,
     messageId: string,
-    contentOverride?: string,
+    opts?: { contentOverride?: string; senderId?: string },
   ): Promise<string | undefined> {
     const record = this.records.get(key(scope, messageId));
     if (!record) return undefined;
@@ -224,8 +261,9 @@ export class InboundJournal {
       messageId: newId,
       scope: record.scope,
       chatId: record.chatId,
-      senderId: record.senderId,
-      content: contentOverride ?? record.content,
+      // The re-dispatch belongs to the actor who clicked the recovery card.
+      senderId: opts?.senderId ?? record.senderId,
+      content: opts?.contentOverride ?? record.content,
       acceptedAt: this.now(),
       status: 'queued',
       ...(record.threadId ? { threadId: record.threadId } : {}),
@@ -286,7 +324,20 @@ export class InboundJournal {
     await Promise.all([...this.persistQueue.values()]);
   }
 
-  private async persistScope(scope: string): Promise<boolean> {
+  /**
+   * Serialize all writes per scope: each persist task chains on the previous
+   * one for the same scope, so concurrent state transitions can never write
+   * a stale snapshot over a newer one (last executed task always dumps the
+   * most recent full state).
+   */
+  private persistScope(scope: string): Promise<boolean> {
+    const prev = this.persistQueue.get(scope) ?? Promise.resolve(true);
+    const task = prev.then(() => this.writeScope(scope));
+    this.persistQueue.set(scope, task);
+    return task;
+  }
+
+  private async writeScope(scope: string): Promise<boolean> {
     const records = [...this.records.values()]
       .filter((r) => r.scope === scope)
       .sort((a, b) => a.acceptedAt - b.acceptedAt);

@@ -188,10 +188,43 @@ describe('InboundJournal redo contentOverride (继续对话)', () => {
     await j.recordAccepted(accepted({ messageId: 'om_c' }));
     await j.markClaimed('oc_chat1', ['om_c'], 'run-x');
     await j.recoverOnStartup();
-    const newId = await j.redo('oc_chat1', 'om_c', '【恢复】继续');
+    const newId = await j.redo('oc_chat1', 'om_c', { contentOverride: '【恢复】继续' });
     const fresh = j.getRecord('oc_chat1', newId!);
     expect(fresh?.content).toBe('【恢复】继续');
     // Old record keeps its original content for audit.
     expect(j.getRecord('oc_chat1', 'om_c')?.content).toBe('请帮我跑测试');
+  });
+});
+
+describe('InboundJournal pre-spawn claim + bindRun (评审修复)', () => {
+  it('markClaimed reports persistence success; bindRun rebinds provisional → real run id', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_p' }));
+    // Claim before spawn with a provisional run id (persisted = true).
+    expect(await j.markClaimed('oc_chat1', ['om_p'], 'pending:123')).toBe(true);
+    expect(j.getRecord('oc_chat1', 'om_p')?.runId).toBe('pending:123');
+    // Bind the real run id; terminal settle then matches by it.
+    expect(await j.bindRun('oc_chat1', ['om_p'], 'run-real')).toBe(true);
+    expect(j.getRecord('oc_chat1', 'om_p')?.runId).toBe('run-real');
+    expect(await j.markTerminal('oc_chat1', 'run-real', 'done')).toBe(true);
+    expect(j.getRecord('oc_chat1', 'om_p')?.status).toBe('terminal');
+  });
+
+  it('concurrent writes to one scope are serialized — no state is lost', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    // Fire two saves without awaiting the first: without per-scope
+    // serialization the second atomic write could clobber the first.
+    const [a, b] = await Promise.all([
+      j.recordAccepted(accepted({ messageId: 'om_a' })),
+      j.recordAccepted(accepted({ messageId: 'om_b' })),
+    ]);
+    expect(a).toBe('recorded');
+    expect(b).toBe('recorded');
+    await j.flush();
+    const j2 = new InboundJournal(dir);
+    await j2.load();
+    expect(j2.list('oc_chat1').map((r) => r.messageId).sort()).toEqual(['om_a', 'om_b']);
   });
 });

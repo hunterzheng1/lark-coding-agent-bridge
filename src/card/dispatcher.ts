@@ -10,7 +10,7 @@ import type { ProcessPool } from '../bot/process-pool';
 import type { CallbackAuth } from './callback-auth';
 import { runCommandHandler, type CommandContext, type Controls } from '../commands';
 import { log } from '../core/logger';
-import { canUseDm, canUseGroup } from '../policy/access';
+import { canUseDm, canUseGroup, canRunAdminCommand } from '../policy/access';
 import { commandSessionCatalogIdentity } from '../bot/session-catalog-identity';
 import type { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
@@ -26,6 +26,8 @@ import { lookupMessageThreadId } from '../bot/thread-id';
  * fields the agent might set.
  */
 const BRIDGE_CALLBACK_MARKER = '__bridge_cb';
+/** Recovery-card actions must be used within this window after acceptance. */
+const RECOVERY_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
 const LEGACY_CLAUDE_CALLBACK_MARKER = '__claude_cb';
 
 export interface CardDispatchDeps {
@@ -189,7 +191,12 @@ function continuationPrompt(content: string): string {
  *   original task from scratch; expired (never dispatched) → just dispatch
  *   the original content into the current session, no reset.
  * - `inbound.dismiss`: settle without running.
- * All are idempotent — a second click on a settled record answers 已处理过.
+ *
+ * Authorization: only the record's original sender or a profile admin may
+ * act — another group member must not be able to re-run (or reset the
+ * session for) someone else's task. The re-dispatched message carries the
+ * real clicker's identity so dispatch-time policy checks evaluate the
+ * actual actor. Actions expire 24h after acceptance; all are idempotent.
  */
 async function handleInboundRecoveryAction(
   deps: CardDispatchDeps,
@@ -218,6 +225,25 @@ async function handleInboundRecoveryAction(
     return;
   }
 
+  const clicker = input.msg.senderId;
+  const isOwnerOrAdmin =
+    record.senderId === clicker ||
+    canRunAdminCommand(deps.controls.profileConfig, deps.controls, clicker).ok;
+  if (!isOwnerOrAdmin) {
+    log.warn('inbound', 'recovery-denied-not-owner', {
+      scope: input.scope,
+      messageId: input.messageId,
+      owner: record.senderId.slice(-6),
+      clicker: clicker.slice(-6),
+    });
+    send('仅原任务所有者或管理员可操作该恢复卡。');
+    return;
+  }
+  if (Date.now() - record.acceptedAt > RECOVERY_ACTION_TTL_MS) {
+    send('该恢复卡已超过 24 小时操作时限，请直接重新发送任务。');
+    return;
+  }
+
   if (input.cmd === 'inbound.dismiss') {
     await journal.markDismissed(input.scope, input.messageId);
     log.info('inbound', 'recovery-dismiss', { scope: input.scope, messageId: input.messageId });
@@ -226,7 +252,10 @@ async function handleInboundRecoveryAction(
   }
 
   const dispatch = async (content: string): Promise<void> => {
-    const newId = await journal.redo(input.scope, input.messageId, content);
+    const newId = await journal.redo(input.scope, input.messageId, {
+      contentOverride: content,
+      senderId: clicker,
+    });
     if (!newId) {
       send('该恢复记录已处理过。');
       return;
@@ -237,7 +266,9 @@ async function handleInboundRecoveryAction(
       chatId: m.chatId,
       chatType: m.chatType === 'p2p' ? 'p2p' : 'group',
       ...(m.threadId ? { threadId: m.threadId } : {}),
-      senderId: m.senderId,
+      // Real clicker identity — dispatch-time policy checks must evaluate
+      // the actual actor, never the original record's sender.
+      senderId: clicker,
       senderName: undefined,
       content,
       rawContentType: 'text',

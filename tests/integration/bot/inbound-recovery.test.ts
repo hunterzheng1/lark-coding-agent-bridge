@@ -318,3 +318,45 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
   }
   throw new Error('timed out waiting for async work');
 }
+
+describe('inbound journal review fixes (阻断 1/2)', () => {
+  it('a redelivered message whose run already finished does not execute again', async () => {
+    const h = await startBridge({ journalDir: await mkdtempInbound() });
+    await h.channel.handlers.message?.(message('once only'));
+    await waitFor(() => h.agent.runs.length === 1);
+    await waitFor(() => h.journal.list('oc_dm')[0]!.status === 'terminal');
+
+    // Feishu redelivers the same event id (message() derives it from content).
+    await h.channel.handlers.message?.(message('once only'));
+    await new Promise((r) => setTimeout(r, 700)); // past the debounce window
+    expect(h.agent.runs).toHaveLength(1);
+  });
+
+  it('two rapid redeliveries within the debounce window produce exactly one run', async () => {
+    const h = await startBridge({ journalDir: await mkdtempInbound() });
+    await h.channel.handlers.message?.(message('rapid dupe'));
+    await h.channel.handlers.message?.(message('rapid dupe'));
+    await waitFor(() => h.agent.runs.length >= 1);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(h.agent.runs).toHaveLength(1);
+  });
+
+  it('an unpersistable claim aborts the run before spawn and informs the user', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const dir = await mkdtemp(join(tmpdir(), 'inbound-broken-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    });
+    const blocker = join(dir, 'occupied');
+    await writeFile(blocker, 'occupied', 'utf8');
+
+    const h = await startBridge({ journalDir: blocker });
+    await h.channel.handlers.message?.(message('side effect task'));
+    await waitFor(
+      () => h.channel.sent.some((s) => JSON.stringify(s.content).includes('取消本次启动')),
+      6000,
+    );
+    expect(h.agent.runs).toHaveLength(0);
+  });
+});

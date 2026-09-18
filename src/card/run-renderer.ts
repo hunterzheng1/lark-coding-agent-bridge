@@ -46,7 +46,9 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
  * ladder (shrink reasoning first, then body text) until the card fits.
  * Terminal notices, error notes, and the stop control are rendered at every
  * rung — degradation must never hide failure state. Pure; input untouched.
- * Falls back to the smallest rung's output if even that exceeds the budget.
+ * If even the smallest ladder rung exceeds the budget (e.g. an unbounded
+ * upstream error message), fall back to a guaranteed-minimal skeleton that
+ * clamps the error text; the full error stays available via /doctor logs.
  */
 export function renderCardBounded(state: RunState, options: RunCardRenderOptions = {}): object {
   const budget = options.budgetBytes ?? CARD_PAYLOAD_BUDGET_BYTES;
@@ -56,7 +58,46 @@ export function renderCardBounded(state: RunState, options: RunCardRenderOptions
     last = renderCardWithReasoningMax(windowed, options, rung.reasoningMax);
     if (wireBytes(last) <= budget) return last;
   }
-  return last!;
+  const skeleton = renderErrorSkeleton(state, options);
+  // The skeleton clamps every unbounded field; it always fits in practice.
+  return skeleton;
+}
+
+const SKELETON_ERROR_CHARS = 400;
+
+/** Last-resort card: terminal status + clamped error + stop control only. */
+function renderErrorSkeleton(state: RunState, options: RunCardRenderOptions): object {
+  const elements: object[] = [];
+  if (state.terminal === 'running' && options.progress) {
+    elements.push(progressStatus(options.progress));
+  }
+  if (state.terminal === 'interrupted') {
+    elements.push(noteMd('_⏹ 已被中断_'));
+  } else if (state.terminal === 'idle_timeout') {
+    const mins = state.idleTimeoutMinutes ?? 0;
+    elements.push(noteMd(`_⏱ ${mins} 分钟无响应,已自动终止_`));
+  } else if (state.terminal === 'error') {
+    const raw = state.errorMsg ?? '未知错误';
+    const clamped =
+      raw.length > SKELETON_ERROR_CHARS
+        ? `${raw.slice(0, SKELETON_ERROR_CHARS)}…（完整错误见 /doctor 日志）`
+        : raw;
+    elements.push(noteMd(`⚠️ agent 失败：${clamped}`));
+  } else if (state.terminal === 'done') {
+    elements.push(noteMd('_（正文过长已折叠）回复 /last full 查看完整结果_'));
+  }
+  if (state.terminal === 'running') {
+    if (state.footer) elements.push(footerStatus(state.footer));
+    elements.push(stopButton(options));
+  }
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: state.terminal === 'running',
+      summary: { content: summaryText(state) },
+    },
+    body: { elements },
+  };
 }
 
 function wireBytes(card: object): number {

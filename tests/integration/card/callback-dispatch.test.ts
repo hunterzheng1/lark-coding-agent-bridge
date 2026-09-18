@@ -124,7 +124,7 @@ async function seedUncertain(h: Harness): Promise<void> {
     messageId: 'om_side_effect',
     scope: 'oc_group',
     chatId: 'oc_group',
-    senderId: 'ou_operator',
+    senderId: 'ou_alice',
     content: 'possibly deployed task',
     acceptedAt: Date.now(),
     chatType: 'group',
@@ -138,7 +138,7 @@ describe('recovery card actions (inbound.redo / inbound.dismiss)', () => {
     const h = await createHarness();
     await seedUncertain(h);
 
-    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' }, undefined, 'ou_alice');
 
     // Old record settled, fresh queued record created.
     const old = h.journal.getRecord('oc_group', 'om_side_effect');
@@ -147,14 +147,17 @@ describe('recovery card actions (inbound.redo / inbound.dismiss)', () => {
     const queued = h.pending.cancel('oc_group');
     expect(queued).toHaveLength(1);
     expect(queued[0]?.content).toBe('possibly deployed task');
+    // The re-dispatch belongs to the real clicker, not the original sender.
+    expect(queued[0]?.senderId).toBe('ou_alice');
     const newRecord = h.journal.list('oc_group').find((r) => r.messageId === queued[0]?.messageId);
     expect(newRecord?.status).toBe('queued');
+    expect(newRecord?.senderId).toBe('ou_alice');
   });
 
   it('a second redo click is a no-op (record already settled)', async () => {
     const h = await createHarness();
     await seedUncertain(h);
-    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' }, undefined, 'ou_alice');
     expect(h.pending.cancel('oc_group')).toHaveLength(1);
 
     await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
@@ -167,7 +170,7 @@ describe('recovery card actions (inbound.redo / inbound.dismiss)', () => {
     const h = await createHarness();
     await seedUncertain(h);
 
-    await h.dispatch({ cmd: 'inbound.dismiss', arg: 'om_side_effect' });
+    await h.dispatch({ cmd: 'inbound.dismiss', arg: 'om_side_effect' }, undefined, 'ou_alice');
 
     expect(h.journal.getRecord('oc_group', 'om_side_effect')?.terminalState).toBe('dismissed');
     expect(h.pending.cancel('oc_group')).toHaveLength(0);
@@ -273,6 +276,44 @@ describe('recovery card 继续对话 vs 重头重做 split', () => {
   });
 });
 
+
+describe('recovery card operator binding (评审修复)', () => {
+  it('denies a click from a user who is neither the owner nor an admin', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' }, undefined, 'ou_operator');
+
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('仅原任务所有者或管理员');
+    expect(h.journal.getRecord('oc_group', 'om_side_effect')?.status).toBe('uncertain');
+  });
+
+  it('allows an admin who is not the owner, using the admin as the actor', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' }, undefined, 'ou_admin');
+
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.senderId).toBe('ou_admin');
+  });
+
+  it('ignores actions on records past the 24h action window', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+    // Backdate the record beyond the action TTL.
+    const rec = h.journal.getRecord('oc_group', 'om_side_effect');
+    if (rec) rec.acceptedAt = Date.now() - 25 * 60 * 60 * 1000;
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' }, undefined, 'ou_alice');
+
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('24 小时');
+  });
+});
+
 type Harness = {
   tmp: TmpProfile;
   channel: FakeChannel;
@@ -284,7 +325,11 @@ type Harness = {
   pending: PendingQueue;
   auth: CallbackAuth;
   journal: InboundJournal;
-  dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
+  dispatch(
+    value: Record<string, unknown>,
+    formValue?: Record<string, unknown>,
+    operatorOpenId?: string,
+  ): Promise<void>;
   token(
     action: string,
     overrides?: { operatorOpenId?: string; nonce?: string; scope?: string },
@@ -308,7 +353,7 @@ async function createHarness(
     profileConfig: createDefaultProfileConfig({
       agentKind: 'claude',
       accounts: { app: { id: 'app-id', secret: 'secret', tenant: 'feishu' } },
-      access: { allowedChats: ['oc_group'] },
+      access: { allowedChats: ['oc_group'], admins: ['ou_admin'] },
     }),
     botOwnerId: 'ou_owner',
     ownerRefreshState: 'ok',
@@ -319,7 +364,7 @@ async function createHarness(
     cfg: createDefaultProfileConfig({
       agentKind: 'claude',
       accounts: { app: { id: 'app-id', secret: 'secret', tenant: 'feishu' } },
-      access: { allowedChats: ['oc_group'] },
+      access: { allowedChats: ['oc_group'], admins: ['ou_admin'] },
     }),
     processId: 'proc-1',
   } satisfies Controls;
@@ -362,10 +407,10 @@ async function createHarness(
         ttlMs: 60_000,
       });
     },
-    dispatch: (value, formValue) =>
+    dispatch: (value, formValue, operatorOpenId) =>
       handleCardAction({
         channel: channel as unknown as Parameters<typeof handleCardAction>[0]['channel'],
-        evt: cardEvent(value, formValue),
+        evt: cardEvent(value, formValue, operatorOpenId),
         sessions,
         workspaces,
         activeRuns,
@@ -383,13 +428,14 @@ async function createHarness(
 function cardEvent(
   value: Record<string, unknown>,
   formValue?: Record<string, unknown>,
+  operatorOpenId?: string,
 ): CardActionEvent {
   return {
     action: { value },
     chatId: 'oc_group',
     messageId: 'om_card',
     operator: {
-      openId: 'ou_operator',
+      openId: operatorOpenId ?? 'ou_operator',
       name: 'Operator',
     },
     raw: formValue ? { action: { form_value: formValue } } : undefined,

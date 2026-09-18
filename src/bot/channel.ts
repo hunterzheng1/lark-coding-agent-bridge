@@ -511,6 +511,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         sessionCatalog?.flush(),
         callbackNonceStore?.flush(),
         workspaces.flush(),
+        thinkingHistory?.flush(),
+        inboundJournal?.flush(),
       ]);
       if (stopAllResult.status === 'rejected') {
         log.fail('disconnect', stopAllResult.reason, { step: 'stopAll' });
@@ -711,6 +713,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       .catch(() => 'failed' as const);
     if (result === 'failed') {
       log.warn('inbound', 'accept-not-durable', { scope, messageId: msg.messageId });
+    } else if (result === 'duplicate') {
+      // Feishu redelivery of an event we already accepted (queued, claimed or
+      // terminal). Dispatching it again could merge it into a running prompt
+      // or start a second run — OPT-04: duplicates must not re-execute.
+      log.info('inbound', 'duplicate-dropped', { scope, messageId: msg.messageId });
+      return;
     }
   }
 
@@ -843,6 +851,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
+    beforeSpawn: async () => {
+      // OPT-04: claim the batch atomically BEFORE the agent spawns. If the
+      // claim cannot be persisted, startRunFlow aborts the run — otherwise a
+      // crash here would leave the records queued and a restart would
+      // re-execute a task whose side effects already happened.
+      const claimed = await inboundJournal?.markClaimed(
+        scope,
+        batch.map((m) => m.messageId),
+        `pending:${Date.now()}`,
+      );
+      if (inboundJournal && !claimed) {
+        throw new Error('inbound journal claim could not be persisted');
+      }
+    },
     prompt: async ({ resumeFrom }) => {
       let topicContext: QuotedContext[] = [];
       if (mode === 'topic' && threadId && !resumeFrom) {
@@ -887,28 +909,34 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       source: 'im',
       code: flow.rejectReason.code,
     });
-    // A rejection is final for these messages — journal them settled so a
-    // restart does not replay them into the same rejection.
+    if (flow.rejectReason.code === 'journal-claim-failed') {
+      log.warn('inbound', 'claim-abort', { scope });
+    }
+    // A rejection is final for these messages — settle them so a restart
+    // does not replay them into the same rejection. Covers queued records
+    // (rejected before spawn) and claimed ones (claim persisted but the
+    // executor refused — no agent ever started).
     await inboundJournal
       ?.markRejected(
         scope,
         batch.map((m) => m.messageId),
       )
-      .catch(() => undefined);
+      .catch((err) => log.fail('inbound', err, { step: 'mark-rejected', scope }));
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
     return;
   }
 
   const { execution, cwdRealpath: cwd } = flow;
-  // OPT-04 claim: the run is about to spawn for this batch — record it so a
-  // crash between spawn and completion classifies as uncertain, not rerun.
+  // OPT-04: bind the pre-spawn provisional claim to the real run id. Failure
+  // is conservative-safe (record stays claimed → uncertain on restart) but
+  // must be visible.
   await inboundJournal
-    ?.markClaimed(
+    ?.bindRun(
       scope,
       batch.map((m) => m.messageId),
       execution.runId,
     )
-    .catch(() => undefined);
+    .catch((err) => log.fail('inbound', err, { step: 'bind-run', scope, runId: execution.runId }));
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -963,15 +991,23 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         (b) => b.kind === 'tool' && b.tool.status === 'error',
       ).length;
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
-      // OPT-04: the run reached a known terminal state — journal it so a
-      // restart never classifies this batch as uncertain.
-      void inboundJournal
-        ?.markTerminal(scope, execution.runId, state.terminal)
-        .catch(() => undefined);
       const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated, failedTools });
       // Persist the run's thinking before advertising the /thinking entry —
       // a failed save must not produce a dead hint (OPT-01B).
       void (async () => {
+        // OPT-04: the run reached a known terminal state — journal it so a
+        // restart never classifies this batch as uncertain. A failed settle
+        // leaves the record claimed (→ uncertain, never auto-rerun) and is
+        // reported.
+        const settled = await inboundJournal
+          ?.markTerminal(scope, execution.runId, state.terminal)
+          .catch((err) => {
+            log.fail('inbound', err, { step: 'mark-terminal', scope, runId: execution.runId });
+            return false;
+          });
+        if (inboundJournal && !settled) {
+          log.warn('inbound', 'terminal-not-durable', { scope, runId: execution.runId });
+        }
         let notice = baseNotice;
         if (thinkingHistory) {
           const endedAt = Date.now();

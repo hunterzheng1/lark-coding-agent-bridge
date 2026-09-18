@@ -51,13 +51,15 @@ export interface AgentCapability {
 
 export function claudeCapability(profile?: Pick<ProfileConfig, 'permissions'>): AgentCapability {
   const maxAccess = profile?.permissions.maxAccess ?? 'full';
+  const interactions = streamJsonInteractions(true);
   return {
     agentId: 'claude',
     sessionKind: 'claude-session',
     promptInjection: 'append-system-prompt',
     systemPrompt: BRIDGE_SYSTEM_PROMPT,
-    supportsNativeHistory: true,
-    interactions: streamJsonInteractions(true),
+    // Compat alias — interactions.nativeHistory is the single source of truth.
+    supportsNativeHistory: interactions.nativeHistory,
+    interactions,
     callback: {
       marker: '__bridge_cb',
       legacyMarkers: ['__claude_cb'],
@@ -70,24 +72,25 @@ export function claudeCapability(profile?: Pick<ProfileConfig, 'permissions'>): 
 
 export function codexCapability(profile: Pick<ProfileConfig, 'permissions'>): AgentCapability {
   const maxAccess = profile.permissions.maxAccess;
+  const interactions: InteractionCapabilities = {
+    // Protocol evidence: src/agent/codex/jsonl.ts maps agent_message /
+    // command execution / token_count — no reasoning items.
+    thinkingEvents: false,
+    incrementalText: true,
+    usageEvents: true,
+    nativeHistory: false,
+    inputRequest: false,
+    toolApproval: false,
+    taskList: false,
+    steer: false,
+  };
   return {
     agentId: 'codex',
     sessionKind: 'codex-thread',
     promptInjection: 'stdin-prefix',
     systemPrompt: BRIDGE_SYSTEM_PROMPT,
-    supportsNativeHistory: false,
-    interactions: {
-      // Protocol evidence: src/agent/codex/jsonl.ts maps agent_message /
-      // command execution / token_count — no reasoning items.
-      thinkingEvents: false,
-      incrementalText: true,
-      usageEvents: true,
-      nativeHistory: false,
-      inputRequest: false,
-      toolApproval: false,
-      taskList: false,
-      steer: false,
-    },
+    supportsNativeHistory: interactions.nativeHistory,
+    interactions,
     callback: {
       marker: '__bridge_cb',
       legacyMarkers: [],
@@ -100,15 +103,16 @@ export function codexCapability(profile: Pick<ProfileConfig, 'permissions'>): Ag
 
 export function codebuddyCapability(profile?: Pick<ProfileConfig, 'permissions'>): AgentCapability {
   const maxAccess = profile?.permissions.maxAccess ?? 'full';
+  const interactions = streamJsonInteractions(true);
   return {
     agentId: 'codebuddy',
     sessionKind: 'codebuddy-session',
     promptInjection: 'append-system-prompt',
     systemPrompt: BRIDGE_SYSTEM_PROMPT,
-    supportsNativeHistory: true,
+    supportsNativeHistory: interactions.nativeHistory,
     // Protocol evidence: CodeBuddyAdapter reuses the Claude stream-json
     // translator, so thinking/text/usage mappings carry over 1:1.
-    interactions: streamJsonInteractions(true),
+    interactions,
     callback: {
       marker: '__bridge_cb',
       legacyMarkers: [],

@@ -121,3 +121,21 @@ describe('OPT-03: renderCardBounded degradation ladder', () => {
     expect(wireBytes(a)).toBeLessThanOrEqual(6_000);
   });
 });
+
+describe('OPT-03 评审修复: guaranteed-minimal error skeleton', () => {
+  it('an unbounded upstream error message is clamped into the budget', () => {
+    const rawError = `ECONNRESET ${'stack-frame '.repeat(400)}UNIQUE_TAIL_987654321`;
+    const state = buildState({
+      text: '长'.repeat(4000),
+      thinking: '思'.repeat(1500),
+      error: rawError,
+    });
+    const card = renderCardBounded(state, { budgetBytes: 2_500 });
+    expect(wireBytes(card)).toBeLessThanOrEqual(2_500);
+    const body = JSON.stringify(card);
+    expect(body).toContain('agent 失败');
+    expect(body).toContain('/doctor');
+    // The raw oversized error must not sneak through.
+    expect(body).not.toContain('UNIQUE_TAIL_987654321');
+  });
+});

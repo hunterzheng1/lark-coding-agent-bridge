@@ -922,6 +922,12 @@ async function handleThinking(args: string, ctx: CommandContext): Promise<void> 
     await reply(ctx, `🧠 当前 agent（${ctx.agent.displayName}）不产生思考事件，没有思考记录可查询。`);
     return;
   }
+  // OPT-06: thinking is persisted only at terminal state. While a run is
+  // active, say so explicitly so the previous record is not mistaken for the
+  // current task's thinking.
+  const running = Boolean(ctx.activeRuns.get(ctx.scope));
+  const runningNotice =
+    '⚠️ 当前有任务正在运行，其思考内容要等运行结束后才会保存；以下为**上一轮**已保存记录。\n\n';
   const parts = args.trim().split(/\s+/).filter(Boolean);
   let ref: string | undefined;
   let page = 1;
@@ -955,7 +961,12 @@ async function handleThinking(args: string, ctx: CommandContext): Promise<void> 
 
   const metas = store.list(ctx.scope);
   if (metas.length === 0) {
-    await reply(ctx, '🧠 本会话暂无已保存的思考记录。运行结束后会自动保存。');
+    await reply(
+      ctx,
+      running
+        ? '🧠 当前有任务正在运行，其思考内容要等运行结束后才会保存。结束后再发 /thinking 查看。'
+        : '🧠 本会话暂无已保存的思考记录。运行结束后会自动保存。',
+    );
     return;
   }
   const latest = metas[0]!;
@@ -977,17 +988,18 @@ async function handleThinking(args: string, ctx: CommandContext): Promise<void> 
         : '本会话还没有含思考的运行。';
     await reply(
       ctx,
-      `🧠 最近一次运行（run ${shortRunId(latest.runId)} · ${terminalText(latest.terminal)}）没有思考内容。\n${olderHint}`,
+      `${running ? runningNotice : ''}🧠 最近一次运行（run ${shortRunId(latest.runId)} · ${terminalText(latest.terminal)}）没有思考内容。\n${olderHint}`,
     );
     return;
   }
-  await replyThinkingPage(ctx, lookup.record, page);
+  await replyThinkingPage(ctx, lookup.record, page, running ? runningNotice : undefined);
 }
 
 async function replyThinkingPage(
   ctx: CommandContext,
   record: ThinkingRecord,
   page: number,
+  notice?: string,
 ): Promise<void> {
   const totalPages = Math.max(1, Math.ceil(record.content.length / THINKING_PAGE_CHARS));
   const short = shortRunId(record.runId);
@@ -996,6 +1008,7 @@ async function replyThinkingPage(
     return;
   }
   const header =
+    (notice ?? '') +
     `🧠 思考记录 run ${short} · ${record.agent} · ${terminalText(record.terminal)} · ` +
     `共 ${record.content.length} 字符 · 第 ${page}/${totalPages} 页`;
   const partialLine = record.partial

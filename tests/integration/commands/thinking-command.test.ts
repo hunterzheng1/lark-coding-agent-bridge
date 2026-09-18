@@ -4,6 +4,7 @@ import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tryHandleCommand, type CommandContext, type Controls } from '../../../src/commands/index.js';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema.js';
+import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { ThinkingHistoryStore } from '../../../src/session/thinking-history.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
@@ -20,6 +21,7 @@ afterEach(async () => {
 interface Harness {
   channel: FakeChannel;
   history: ThinkingHistoryStore;
+  activeRuns: ActiveRuns;
   run(content: string, overrides?: { scope?: string; chatId?: string }): Promise<boolean>;
   /** All markdown replies sent so far, in order. */
   replies(): string[];
@@ -34,6 +36,7 @@ async function createHarness(): Promise<Harness> {
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
   const history = new ThinkingHistoryStore(join(tmp.profile, 'thinking'));
   await history.load();
+  const activeRuns = new ActiveRuns();
   const profileConfig: ProfileConfig = createDefaultProfileConfig({
     agentKind: 'claude',
     accounts: { app: { id: 'app-id', secret: 'secret', tenant: 'feishu' } },
@@ -68,7 +71,7 @@ async function createHarness(): Promise<Harness> {
       sessions,
       workspaces,
       agent: createFakeAgent(),
-      activeRuns: {} as CommandContext['activeRuns'],
+      activeRuns,
       controls,
       thinkingHistory: history,
     };
@@ -92,6 +95,7 @@ async function createHarness(): Promise<Harness> {
   return {
     channel,
     history,
+    activeRuns,
     run,
     replies,
     lastReply: () => {
@@ -262,7 +266,7 @@ describe('/thinking command', () => {
       sessions: new SessionStore(join(tmp.profile, 'sessions.json')),
       workspaces: new WorkspaceStore(join(tmp.profile, 'workspaces.json')),
       agent: createFakeAgent(),
-      activeRuns: {} as CommandContext['activeRuns'],
+      activeRuns: new ActiveRuns(),
       controls,
     });
     const markdowns = channel.sent
@@ -273,5 +277,30 @@ describe('/thinking command', () => {
       )
       .filter(Boolean);
     expect(markdowns.some((md) => md.includes('不可用'))).toBe(true);
+  });
+});
+
+describe('/thinking while a run is active (评审修复)', () => {
+  it('says the current run is not saved yet and labels the reply as the previous round', async () => {
+    const h = await createHarness();
+    await save(h, { runId: RUN_A, content: 'previous round thoughts' });
+    const agent = createFakeAgent();
+    h.activeRuns.register('chat-1', agent.run({ runId: 'run-live', prompt: 'busy' }));
+
+    await h.run('/thinking');
+    const reply = h.lastReply();
+    expect(reply).toContain('正在运行');
+    expect(reply).toContain('上一轮');
+    expect(reply).toContain('previous round thoughts');
+  });
+
+  it('running with no saved records says so without showing anything stale', async () => {
+    const h = await createHarness();
+    const agent = createFakeAgent();
+    h.activeRuns.register('chat-1', agent.run({ runId: 'run-live', prompt: 'busy' }));
+
+    await h.run('/thinking');
+    expect(h.lastReply()).toContain('正在运行');
+    expect(h.lastReply()).not.toContain('上一轮');
   });
 });
