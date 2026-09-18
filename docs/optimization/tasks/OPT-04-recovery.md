@@ -80,6 +80,13 @@
 3. **trackSettle 死区**：`pendingSettles`/`trackSettle` 初始化移至 `PendingQueue` 创建之前——启动后立即到达的消息可能在连接完成前触发合批，原顺序会访问未初始化变量。影子 Promise 追踪不吞原始拒绝。
 4. **首写失败回滚去重预约**：`recordAccepted` 持久化失败时删除本次 reservation 并返回 failed——写入失败后的重投递不会被永久误判为 duplicate。新增「写入失败 → 恢复 → 重投」测试。
 
+### 评审四轮修复（2026-09-18）
+
+1. **「重头重做」改为 journal 意图驱动**：三轮方案「先入队、成功后在 dispatcher 里重置」仍有两个窗口——identity 解析超过 600ms 合批窗时新任务先启动并续接旧会话；入队后、重置前崩溃则重启重放同样续接旧会话（`beforeSpawn` 位于 resume 解析之后，钩子内重置无效）。现由 `journal.redo(..., { resetSession: true })` 把重置意图随重派记录持久化，`runAgentBatch` 在 `startRunFlow` 解析 resume 与认领之前执行归档 + `sessions.clear` 并清旗；崩溃重放同一路径天然覆盖，旗标未清则重放幂等再执行。新增 e2e：门控认领证明重置严格先于 claim/spawn。
+2. **「继续对话」成功文案按原始状态判断**：`journal.redo()` 原地把 `record.status` 改为 terminal，回调返回后再读状态使 uncertain 误报「该记录未曾执行」。改为点击时同步捕获 `wasUncertain`。新增断言：uncertain 继续对话回复「已在原会话」。
+3. **停机生命周期跟踪再前置**：批次 Promise（模式解析→媒体/引用→策略→spawn→流→终态）此前只在 `processAgentStream` 创建处登记，disconnect 落在该死区时排空集合为空、flush 提前。现 PendingQueue 回调创建完整批次 Promise 即 `trackSettle`。新增 e2e：批次停在 spawn 前认领时断连，`disconnect` 返回即记录已落 terminal/rejected。
+4. **reservation 回滚加对象同一性守卫**：`recordAccepted` 首写失败的无条件 `records.delete(k)` 可能删除写入期间被 `/new` 清空后以同 id 重建的新记录。现仅在 `records.get(k) === 本次 reservation` 时删除。新增替换场景单测。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
