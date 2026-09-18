@@ -417,6 +417,66 @@ describe('重头重做 resetSession 意图（评审四轮）', () => {
   });
 });
 
+describe('优雅停机显式取消（评审五轮）', () => {
+  it('disconnect waits a batch parked past the old 3s cap until it settles on disk', async () => {
+    const dir = await mkdtempInbound();
+    const journal = new GatedClaimJournal(dir);
+    let release!: () => void;
+    journal.gate = new Promise<void>((r) => (release = r));
+    const h = await startBridge({ journal });
+
+    await h.channel.handlers.message?.(message('parked past 3s'));
+    await waitFor(() => journal.claimReached, 8000);
+
+    // Park 4.2s — beyond the removed fixed 3s drain cap. The claim/terminal
+    // path is local work and is never raced away, so disconnect must keep
+    // waiting instead of flushing early and returning.
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(release, 4200);
+    await disconnecting;
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4000);
+
+    // disconnect returned ⇒ the settled record is already on disk.
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm')[0]?.status).toBe('terminal');
+    expect(onDisk.list('oc_dm')[0]?.terminalState).toBe('rejected');
+    expect(h.agent.runs).toHaveLength(0);
+  }, 30_000);
+
+  it('disconnect cancels a hung pre-spawn quote fetch and leaves the record queued for replay', async () => {
+    const dir = await mkdtempInbound();
+    const h = await startBridge({ journalDir: dir });
+    // The quote fetch's REST call never resolves — the exact hang the old
+    // fixed 3s cap papered over by flushing and returning early.
+    let quoteRequested = false;
+    (h.channel as unknown as { fetchRawMessage: () => Promise<never> }).fetchRawMessage = () => {
+      quoteRequested = true;
+      return new Promise<never>(() => {});
+    };
+    await h.channel.handlers.message?.(
+      {
+        ...message('quoted hang task'),
+        replyToMessageId: 'om_quoted_target',
+      } as unknown as NormalizedMessage,
+    );
+    // Deterministically parked inside fetchQuotedContext when we disconnect.
+    await waitFor(() => quoteRequested, 8000);
+
+    const startedAt = Date.now();
+    await h.bridge.disconnect();
+    // Cancellation lands immediately (batch breaks out at the abort), not
+    // after a timeout — and no terminal write is skipped: the batch never
+    // claimed, so the record stays queued and the next start replays it.
+    expect(Date.now() - startedAt).toBeLessThan(2000);
+    expect(h.agent.runs).toHaveLength(0);
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm')[0]?.status).toBe('queued');
+  }, 15_000);
+});
+
 describe('inbound journal review fixes (阻断 1/2)', () => {
   it('a redelivered message whose run already finished does not execute again', async () => {
     const h = await startBridge({ journalDir: await mkdtempInbound() });

@@ -281,6 +281,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     return p;
   };
 
+  // OPT-04 (评审五轮): graceful shutdown explicitly CANCELS pre-spawn
+  // network awaits (chat-mode resolve, media download, quote/topic fetch)
+  // instead of relying on a fixed drain timeout. A batch aborted here never
+  // spawned an agent, so its journal record stays `queued` and the next
+  // startup replays it — exactly the "never dispatched" semantics. Local
+  // writes (claim / terminal) are never raced away; disconnect always waits
+  // for those to settle.
+  const shutdown = new AbortController();
+
   const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
@@ -294,7 +303,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       withTrace({ chatId: firstMsg.chatId }, async () => {
         log.info('flush', 'start', { scope, batchSize: batch.length });
         try {
-          const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
+          const resolvedMode = await raceShutdown(
+            shutdown.signal,
+            'chat-mode',
+            chatModeCache.resolve(channel, firstMsg.chatId),
+          );
           const mode: ChatMode = firstMsg.threadId ? 'topic' : resolvedMode;
           await runAgentBatch({
             channel,
@@ -312,6 +325,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             scope,
             mode,
             trackSettle,
+            shutdownSignal: shutdown.signal,
           });
         } catch (err) {
           log.fail('flush', err);
@@ -529,20 +543,35 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       knownChatsRefresh.stop();
       keepalive.stop();
       pending.cancelAll();
+      // Phase 0 (评审五轮): explicitly cancel pre-spawn network awaits so
+      // every tracked batch can reach its settle point quickly. Batches
+      // aborted here never spawned, so their records stay queued and are
+      // replayed next start — no terminal write is skipped.
+      shutdown.abort();
       // Phase 1: tear down the connection and stop runs.
       const [disconnectResult, stopAllResult] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
       ]);
-      // Phase 2: wait (bounded) for terminal callbacks to finish writing.
-      // Runs registered at consumption start keep entering the set as they
-      // wind down, so drain repeatedly until empty or the deadline passes.
-      const settleDeadline = Date.now() + 3_000;
+      // Phase 2: wait for ALL tracked batches to genuinely settle (finish or
+      // cancel-land). The only thing that could still be pending after the
+      // Phase-0 abort is a spawn-in-flight batch winding down through its
+      // terminal callbacks — bounded by the agent's own stop grace, so we
+      // size the deadline off that rather than a fixed 3s. The deadline is a
+      // pathological guard only (e.g. a wedged terminal writer); timing out
+      // logs loudly instead of silently flushing early.
+      const settleDeadline = Date.now() + getAgentStopGraceMs(controls.cfg) + 10_000;
       while (pendingSettles.size > 0 && Date.now() < settleDeadline) {
         await Promise.race([
           Promise.allSettled([...pendingSettles]),
           new Promise((resolve) => setTimeout(resolve, 100)),
         ]);
+      }
+      if (pendingSettles.size > 0) {
+        log.warn('disconnect', 'drain-timeout', {
+          pending: pendingSettles.size,
+          note: 'flushing stores with batches still settling',
+        });
       }
       // Phase 3: flush every store only after all writers have settled.
       const flushResults = await Promise.allSettled([
@@ -566,6 +595,31 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       }
     },
   };
+}
+
+/**
+ * OPT-04 (评审五轮): race a pre-spawn network await against the shutdown
+ * signal. When abort fires, the batch breaks out immediately; the underlying
+ * promise keeps running but nobody waits on it (its results are discarded —
+ * safe because the batch never reached spawn). Only ever wrap PRE-spawn
+ * awaits: local claim/terminal writes must be awaited fully, not raced.
+ */
+function raceShutdown<T>(signal: AbortSignal, label: string, work: Promise<T>): Promise<T> {
+  if (signal.aborted) return Promise.reject(new Error(`bridge-shutdown:${label}`));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error(`bridge-shutdown:${label}`));
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 function startKnownChatsRefreshTimer(
@@ -801,6 +855,8 @@ interface RunBatchDeps {
   mode: ChatMode;
   /** Registers in-flight terminal callbacks so shutdown can await them. */
   trackSettle: (p: Promise<unknown>) => Promise<unknown>;
+  /** Aborted at graceful disconnect; cancels pre-spawn network awaits. */
+  shutdownSignal: AbortSignal;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -820,6 +876,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     scope,
     mode,
     trackSettle,
+    shutdownSignal,
   } = deps;
   if (batch.length === 0) return;
   const firstMsg = batch[0];
@@ -832,7 +889,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
   );
-  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments);
+  const attachments = await raceShutdown(
+    shutdownSignal,
+    'media-resolve',
+    media.resolve(resourceItems, controls.profileConfig.attachments),
+  );
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
     for (const attachment of attachments) {
@@ -860,7 +921,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   ];
   const quotes: QuotedContext[] = [];
   for (const targetId of quoteTargets) {
-    const q = await fetchQuotedContext(channel, targetId);
+    const q = await raceShutdown(
+      shutdownSignal,
+      'quote-fetch',
+      fetchQuotedContext(channel, targetId),
+    );
     if (q) {
       quotes.push(q);
       log.info('quote', 'fetched', {
@@ -923,6 +988,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
     }
   }
+  if (shutdownSignal.aborted) {
+    throw new Error('bridge-shutdown:pre-spawn');
+  }
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
@@ -943,10 +1011,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     prompt: async ({ resumeFrom }) => {
       let topicContext: QuotedContext[] = [];
       if (mode === 'topic' && threadId && !resumeFrom) {
-        topicContext = await fetchTopicContext(channel, threadId, {
-          maxMessages: 40,
-          excludeIds: new Set([...batchIds, ...quoteTargets]),
-        });
+        topicContext = await raceShutdown(
+          shutdownSignal,
+          'topic-context',
+          fetchTopicContext(channel, threadId, {
+            maxMessages: 40,
+            excludeIds: new Set([...batchIds, ...quoteTargets]),
+          }),
+        );
         if (topicContext.length > 0) {
           log.info('topic', 'context-fetched', { scope, threadId, count: topicContext.length });
         }
