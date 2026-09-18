@@ -73,6 +73,13 @@
 2. **停机 flush 时序**：`disconnect` 改两阶段——先断连接 + `stopAll`，再（有界 5s）等待全部在途终态回调（journal 落定、思考保存、完成通知）结束，最后才 flush 各存储。终态回调经 `trackSettle` 登记，正常停机后 journal 不会停留 claimed、思考记录不再缺失。
 3. **恢复卡持久化回滚**：`markDismissed`/`redo` 在 `persistScope` 失败时回滚内存变更并返回失败；dispatcher 区分「已处理过」与「⚠️ 暂时无法写入请重试」，不再在磁盘不可写时误报忽略成功。
 
+### 评审三轮修复（2026-09-18，`46c55ce`）
+
+1. **恢复卡失败不再误报成功**：`dispatch()` 返回 `dispatched/settled/retry` 三态；仅成功入队后发送成功提示。「重头重做」改为先持久化并入队、成功后才重置会话——写入失败时旧会话不再丢失（会话重置发生在派发之后的同一个同步 tick，先于 600ms 合批 flush，重置依然有效）。
+2. **停机等待整个运行生命周期**：`runAgentBatch` 的三个 `processAgentStream` 调用点（card/markdown/text）都在消费起始处把运行 Promise 登记进 `trackSettle`，不再依赖 onTerminal 触发时才进入追踪集合；`disconnect` 用有界排空循环（3s 上限/100ms 轮询）等待集合清空后才 flush。曾出现 10s 上限在全量并行测试下引发超时级联，收紧为 3s/100ms（本地落盘为毫秒级）。
+3. **trackSettle 死区**：`pendingSettles`/`trackSettle` 初始化移至 `PendingQueue` 创建之前——启动后立即到达的消息可能在连接完成前触发合批，原顺序会访问未初始化变量。影子 Promise 追踪不吞原始拒绝。
+4. **首写失败回滚去重预约**：`recordAccepted` 持久化失败时删除本次 reservation 并返回 failed——写入失败后的重投递不会被永久误判为 duplicate。新增「写入失败 → 恢复 → 重投」测试。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
