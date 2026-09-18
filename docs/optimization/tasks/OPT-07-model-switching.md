@@ -1,6 +1,6 @@
 # OPT-07：会话模型选择
 
-日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）已实施并本地验证通过（`pnpm ci:local` 全绿）；Slice B（选择卡与目录发现）、Slice C（忙时快照与恢复一致性）尚未实施。以下交互、权限和一致性规则属于设计建议，实施取舍见文末「实施记录：Slice A」。
+日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）与 Slice B（选择卡与目录发现）已实施并本地验证通过（`pnpm ci:local` 全绿）；Slice C（忙时快照与恢复一致性）尚未实施。以下交互、权限和一致性规则属于设计建议，实施取舍见文末「实施记录：Slice A」「实施记录：Slice B」。
 
 ## 目标与结论
 
@@ -167,3 +167,38 @@
 - 崩溃恢复、实际模型展示、权限/回调过期：属 Slice B/C，未覆盖。
 
 模型真实可用性、续接上下文是否覆盖上次模型、飞书移动端交互仍需现场验证，本轮未运行真实模型请求。
+
+## 实施记录：Slice B（2026-09-18，基线 `cb73dca` 之后）
+
+交付 Slice B「选择卡与目录」，`pnpm ci:local` 全绿（typecheck、843 测试、build，较 A 增 26 项）。Slice C 仍未做。
+
+### 目录发现（后端各自适配，公共层只消费统一描述）
+
+- 新增公共门面 `src/agent/model-catalog.ts`：`discoverModelCatalog()` 统一返回 `{ agentId, status, candidates[{id,displayName,source}], fetchedAt, note, unverified }`。按「后端 + binary + tenant + appId」维度缓存，TTL 5 分钟；命中缓存不再查上游，查询失败不清缓存（保留上次好值），且任何情况下手动输入都可用。门面只被 commands/bot/card 引用，后端 runner（`agent/codex/models`、`agent/codebuddy/models`、`agent/claude/models`）藏在门面内，静态架构契约（`commands/index.ts` 不含 `agent/codex`/`agent/codebuddy`）保持通过。
+- Codex：`codex debug models --bundled`（本机 0.144.6 实测存在），离线读随二进制附带的 JSON 目录，解析 `slug/display_name`、过滤 `visibility=hidden`、按 `priority` 排序。用 `--bundled` 避免网络刷新与账号副作用；标注「离线目录，未经本账号实时验证」（`unverified=true`）。
+- CodeBuddy：`codebuddy --help` 的 `--model` 说明里 `Currently supported: (…)` 作为兼容降级源解析（本机 2.154.0）。帮助文本非稳定协议、非账号授权证明；解析失败只让该项回退到手动输入，不拖垮 `/model`。
+- Claude：无稳定列表命令，返回固定的常见别名提示（sonnet/opus/haiku）+ `status='static'`，不 spawn 进程；实际以 CLI 解析为准。
+- 发现走只读子进程 runner（argv 数组、超时 kill、捕获 stdout），不拼 shell、不打印凭证。
+
+### 选择卡与命令
+
+- `src/card/model-card.ts`：schema 2.0 表单，`select_static`（候选，≤30 项、id≤120、展示名截断）+ 手动输入框 + 「应用模型／跟随 CLI 设置／刷新列表」按钮；顶部如实显示当前选择、候选来源与更新时间、未验证提示；失败态显示获取失败并保留手动输入。非管理员进入「查看模式」，隐藏应用/恢复、保留刷新。
+- 命令路由（`handleModel`）：`/model`→选择卡；`/model list`→文本候选（文本回复模式仍能完成全流程）；`/model <id>`→保存；`/model reset`→恢复；`/model refresh`→重新发现并出卡；卡片回调 `model.submit`/`model.reset`/`model.refresh`/`model.open`。`/status` 增「🧠 切换模型」按钮（`model.open`）。
+- 变更类操作统一 `guardModelMutation`：管理员校验 → revision 新鲜度校验 → 忙时校验，任一不过即回复原因且不写。手动输入优先于下拉，且可提交恰为保留字的模型 ID（仅做语法校验，账号可用性交运行期）。
+- revision：`SessionStore.modelRevision` 每 scope 单调递增、durable、跨 `/new`(clear) 与重启保留。选择卡绑定当时 revision；过期卡提交被拒（「该选择卡已过期，请重新打开」），不误改新值。card 派发器现传入 `hasPendingForScope`，卡片提交/恢复同样受排队消息忙时闸门约束。
+
+### Slice B 仍未覆盖（属 Slice C / 待现场验证）
+
+- 入站模型快照、按快照分组合批、崩溃恢复一致性与「上次运行实际模型」展示（`RunState`/system 报告值）仍未做；忙时依旧拒绝修改而非排队切换。
+- 最近使用、跨 Agent 选择、推理强度/预设留作后续。
+- 候选是否本账号可调用、续接是否覆盖上次模型、飞书移动端点击/重复回调/过期卡行为：均只做了源码与本机只读命令核对，未运行真实模型请求或飞书点击测试，需现场单独验证。
+
+### 验证
+
+- 门面解析（Codex/CodeBuddy/Claude）与缓存 TTL/失败/超时/账号隔离：`tests/unit/agent/model-catalog.test.ts`。
+- 只读 runner 真实 spawn + 解析、非零退出降级、Claude 不 spawn：`tests/process/model-discovery.test.ts`。
+- 卡片结构（revision 绑定、手动优先、选项预算、查看模式、失败态）：`tests/unit/card/model-card.test.ts`。
+- revision 递增/保留：`tests/unit/session/model-revision.test.ts`。
+- 命令与卡片回调（出卡、文本列表、submit 应用/过期/越权/忙时拒绝、手动保留字、按后端隔离、不清队列）：`tests/integration/commands/model-command.test.ts`。
+
+模型真实可用性、续接覆盖与飞书移动端交互仍需现场验证，本轮未触发付费模型调用。
