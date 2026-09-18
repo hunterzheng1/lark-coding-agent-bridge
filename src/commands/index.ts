@@ -5,6 +5,11 @@ import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { capabilityForAgentKind, type AgentCapabilityId } from '../agent/capability';
 import type { AgentAdapter } from '../agent/types';
+import {
+  discoverModelCatalog,
+  type DiscoverModelsInput,
+  type ModelCatalogResult,
+} from '../agent/model-catalog';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
   accountCurrentCard,
@@ -21,6 +26,7 @@ import {
   groupMsgScopeGrantedCard,
 } from '../card/config-card';
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
+import { modelSelectCard } from '../card/model-card';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
@@ -142,6 +148,9 @@ export interface CommandContext {
    * so card-synthesized contexts (which never queue) can omit it.
    */
   hasPendingForScope?: (scope: string) => boolean;
+  /** OPT-07 Slice B: injectable model-catalog discovery seam. Defaults to the
+   * real backend discovery; tests pass a stub so `/model` never spawns a CLI. */
+  discoverModels?: (input: DiscoverModelsInput) => Promise<ModelCatalogResult>;
   controls: Controls;
   codexHistoryProvider?: (
     options: ListCodexThreadHistoryOptions,
@@ -502,100 +511,194 @@ async function handleDoc(args: string, ctx: CommandContext): Promise<void> {
   await reply(ctx, '云文档评论现在不需要绑定工作区；在支持的文档评论里 @bot 即可触发回复。');
 }
 
-// ─── /model (OPT-07 slice A: command closed loop) ──────────────────────────
+// ─── /model (OPT-07: Slice A 命令闭环 + Slice B 选择卡) ──────────────────────
 
 const MODEL_ID_MAX_LEN = 120;
 
 async function handleModel(args: string, ctx: CommandContext): Promise<void> {
-  const agentId = ctx.agent.id;
   const input = args.trim();
+  const tokens = input ? input.split(/\s+/) : [];
+  const first = (tokens[0] ?? '').toLowerCase();
 
-  // `/model` with no argument: view the current selection. Read-only, so it is
-  // allowed for anyone who passed the access gate and never touches the queue.
-  if (!input) {
-    await reply(ctx, modelViewText(ctx, agentId));
-    return;
+  switch (first) {
+    case '':
+    case 'open':
+      await sendModelCard(ctx, false);
+      return;
+    case 'refresh':
+      await sendModelCard(ctx, true);
+      return;
+    case 'list':
+      await handleModelListText(ctx);
+      return;
+    case 'submit':
+      await handleModelSubmit(ctx, tokens[1]);
+      return;
+    case 'reset':
+      await handleModelReset(ctx, tokens[1]);
+      return;
+    default:
+      // `/model <模型 ID>` — tokens[0] keeps the original case.
+      await handleModelSet(ctx, tokens[0] ?? '');
   }
+}
 
-  const tokens = input.split(/\s+/);
-  const firstRaw = tokens[0] ?? '';
-  const first = firstRaw.toLowerCase();
-
-  if (first === 'refresh') {
-    // Candidate discovery ships with a later slice; keep the surface honest.
-    await reply(
-      ctx,
-      '🧠 候选模型列表发现尚未支持（后续版本提供）。当前可直接使用 `/model <模型 ID>` 指定，或 `/model reset` 恢复跟随 CLI 设置。',
-    );
-    return;
-  }
-
-  // Set and reset mutate the scope preference. Default policy: only the bot
-  // owner / admins may change what every member's next task runs on (rule 2).
+/** Admin + revision-freshness + busy gates shared by every mutation
+ * (text set, text reset, card submit). Replies and returns false when the
+ * mutation must not proceed. */
+async function guardModelMutation(
+  ctx: CommandContext,
+  revisionArg: string | undefined,
+): Promise<boolean> {
   const admin = canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
   if (!admin.ok) {
     await reply(ctx, '❌ 切换/恢复模型仅管理员或 bot owner 可用；查看请使用 `/model`。');
-    return;
+    return false;
   }
-
-  // Slice A rejects busy-time edits instead of snapshotting in-flight work.
+  if (revisionArg !== undefined) {
+    const bound = Number.parseInt(revisionArg, 10);
+    if (!Number.isFinite(bound) || bound !== ctx.sessions.getModelRevision(ctx.scope)) {
+      await reply(ctx, '⚠️ 该选择卡已过期（模型设置已被更新），请重新打开 `/model`。');
+      return false;
+    }
+  }
   const busy = modelBusyReason(ctx);
   if (busy) {
     await reply(
       ctx,
       `⚠️ ${busy}现在修改会让排队中的消息落到不确定的模型上，请等当前任务处理完再试。查看设置请用 \`/model\`。`,
     );
-    return;
+    return false;
   }
+  return true;
+}
 
-  if (first === 'reset') {
-    let cleared: boolean | null;
-    try {
-      cleared = await ctx.sessions.clearModelPreference(ctx.scope, agentId);
-    } catch {
-      cleared = null;
-    }
-    if (cleared === null) {
-      await reply(ctx, '❌ 保存失败，已保留原模型设置。');
-      return;
-    }
+async function handleModelSet(ctx: CommandContext, idRaw: string): Promise<void> {
+  if (!(await guardModelMutation(ctx, undefined))) return;
+  const validation = validateModelId(idRaw);
+  if (!validation.ok) {
     await reply(
       ctx,
-      cleared
-        ? '✓ 已恢复：此后收到的消息跟随 CLI 设置（不再传 `--model`）。'
-        : '当前本来就没有模型覆盖，仍跟随 CLI 设置。',
+      `❌ ${validation.reason}\n\n用法：\`/model <模型 ID>\` · \`/model reset\` · \`/model list\``,
     );
     return;
   }
+  await applyModel(ctx, validation.modelId);
+}
 
-  const validation = validateModelId(firstRaw);
-  if (!validation.ok) {
-    await reply(ctx, `❌ ${validation.reason}\n\n用法：\`/model <模型 ID>\` · \`/model reset\``);
+async function handleModelReset(
+  ctx: CommandContext,
+  revisionArg: string | undefined,
+): Promise<void> {
+  if (!(await guardModelMutation(ctx, revisionArg))) return;
+  let cleared: boolean | null;
+  try {
+    cleared = await ctx.sessions.clearModelPreference(ctx.scope, ctx.agent.id);
+  } catch {
+    cleared = null;
+  }
+  if (cleared === null) {
+    await reply(ctx, '❌ 保存失败，已保留原模型设置。');
     return;
   }
+  await reply(
+    ctx,
+    cleared
+      ? '✓ 已恢复：此后收到的消息跟随 CLI 设置（不再传 `--model`）。'
+      : '当前本来就没有模型覆盖，仍跟随 CLI 设置。',
+  );
+}
+
+async function handleModelSubmit(
+  ctx: CommandContext,
+  revisionArg: string | undefined,
+): Promise<void> {
+  if (!(await guardModelMutation(ctx, revisionArg))) return;
+  const formValue = ctx.formValue ?? {};
+  const manual = String(formValue.manual_model ?? '').trim();
+  const selected = String(formValue.model ?? '').trim();
+  // Manual input wins, and may carry a reserved word verbatim (only syntax
+  // is checked here; account validity is the backend's to reject at run time).
+  const chosen = manual || selected;
+  if (!chosen) {
+    await reply(ctx, '❌ 未选择模型：请从下拉选择候选，或手动输入模型 ID。');
+    return;
+  }
+  const validation = validateModelId(chosen);
+  if (!validation.ok) {
+    await reply(ctx, `❌ ${validation.reason}`);
+    return;
+  }
+  await applyModel(ctx, validation.modelId);
+}
+
+async function applyModel(ctx: CommandContext, modelId: string): Promise<void> {
   try {
-    await ctx.sessions.setModelPreference(ctx.scope, agentId, validation.modelId);
+    await ctx.sessions.setModelPreference(ctx.scope, ctx.agent.id, modelId);
   } catch {
     await reply(ctx, '❌ 保存失败，已保留原模型设置。');
     return;
   }
   await reply(
     ctx,
-    `✓ 已保存：${validation.modelId}，此后收到的消息使用该设置。\n不会中断当前任务，也不会清空队列。`,
+    `✓ 已保存：${modelId}，此后收到的消息使用该设置。\n不会中断当前任务，也不会清空队列。`,
   );
 }
 
-function modelViewText(ctx: CommandContext, agentId: string): string {
-  const pref = ctx.sessions.getModelPreference(ctx.scope, agentId);
-  return [
-    `🧠 模型设置 · ${ctx.agent.displayName}`,
-    `作用范围：${modelScopeLabel(ctx.chatMode)}`,
-    pref ? `当前选择：${pref.model}` : '当前选择：跟随 CLI 设置（未覆盖）',
-    `上次保存：${pref ? formatRelTime(pref.savedAt) : '—'}`,
-    '',
-    '用法：`/model <模型 ID>` 指定 · `/model reset` 恢复跟随 CLI 设置',
-    '_切换不会中断当前任务，也不清空队列；新设置对之后收到的消息生效。_',
-  ].join('\n');
+async function sendModelCard(ctx: CommandContext, forceRefresh: boolean): Promise<void> {
+  const catalog = await runModelDiscovery(ctx, forceRefresh);
+  const pref = ctx.sessions.getModelPreference(ctx.scope, ctx.agent.id);
+  const canManage = canRunAdminCommand(
+    ctx.controls.profileConfig,
+    ctx.controls,
+    ctx.msg.senderId,
+  ).ok;
+  const card = modelSelectCard({
+    agentName: ctx.agent.displayName,
+    scopeLabel: modelScopeLabel(ctx.chatMode),
+    current: { value: pref?.model, source: pref ? 'override' : 'cli' },
+    catalog,
+    revision: ctx.sessions.getModelRevision(ctx.scope),
+    canManage,
+  });
+  await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
+}
+
+async function handleModelListText(ctx: CommandContext): Promise<void> {
+  const catalog = await runModelDiscovery(ctx, false);
+  const pref = ctx.sessions.getModelPreference(ctx.scope, ctx.agent.id);
+  const head = [
+    `🧠 模型列表 · ${ctx.agent.displayName}`,
+    `当前选择：${pref ? pref.model : '跟随 CLI 设置'}`,
+    catalog.note,
+  ];
+  const body =
+    catalog.candidates.length > 0
+      ? catalog.candidates
+          .slice(0, 40)
+          .map((c) => `• ${c.id}${c.displayName !== c.id ? ` — ${c.displayName}` : ''}`)
+          .join('\n')
+      : '_（无候选，可用 `/model <模型 ID>` 手动指定）_';
+  await reply(
+    ctx,
+    `${head.join('\n')}\n\n${body}\n\n设置：\`/model <模型 ID>\` · 恢复：\`/model reset\` · 选择卡：\`/model\``,
+  );
+}
+
+async function runModelDiscovery(
+  ctx: CommandContext,
+  forceRefresh: boolean,
+): Promise<ModelCatalogResult> {
+  const capability = capabilityForAgentKind(
+    ctx.controls.profileConfig.agentKind,
+    ctx.controls.profileConfig,
+  );
+  const discover = ctx.discoverModels ?? discoverModelCatalog;
+  return discover({
+    capability,
+    profileConfig: ctx.controls.profileConfig,
+    forceRefresh,
+  });
 }
 
 function modelScopeLabel(chatMode: 'p2p' | 'group' | 'topic'): string {

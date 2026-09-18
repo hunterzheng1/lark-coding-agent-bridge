@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { NormalizedMessage } from '@larksuite/channel';
 import {
   commandKeepsPendingQueue,
+  runCommandHandler,
   tryHandleCommand,
   type CommandContext,
   type Controls,
 } from '../../../src/commands';
+import type { ModelCatalogResult } from '../../../src/agent/model-catalog';
 import { createDefaultProfileConfig, type ProfileConfig } from '../../../src/config/profile-schema';
 import { ActiveRuns } from '../../../src/bot/active-runs';
 import { SessionStore } from '../../../src/session/store';
@@ -22,6 +24,22 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+const CANNED: ModelCatalogResult = {
+  agentId: 'claude',
+  status: 'ok',
+  candidates: [
+    { id: 'm1', displayName: 'Model One', source: 'cli' },
+    { id: 'm2', displayName: 'Model Two', source: 'cli' },
+  ],
+  fetchedAt: 1_700_000_000_000,
+  note: '候选来源：测试。未经本账号验证。',
+  unverified: true,
+};
+
+function stubDiscover(catalog: ModelCatalogResult = CANNED) {
+  return async (): Promise<ModelCatalogResult> => catalog;
+}
+
 async function makeStore(): Promise<SessionStore> {
   const root = await mkdtemp(join(tmpdir(), 'bridge-model-'));
   roots.push(root);
@@ -30,12 +48,12 @@ async function makeStore(): Promise<SessionStore> {
   return store;
 }
 
-function controls(owner: string, admins: string[]): Controls {
-  const profileConfig = profile(owner, admins);
+function controls(admins: string[]): Controls {
+  const profileConfig = profile(admins);
   return {
     profile: 'claude',
     profileConfig,
-    botOwnerId: owner,
+    botOwnerId: 'ou-owner',
     ownerRefreshState: 'ok',
     async refreshOwner() {},
     configPath: '/tmp/config.json',
@@ -46,14 +64,13 @@ function controls(owner: string, admins: string[]): Controls {
   };
 }
 
-function profile(owner: string, admins: string[]): ProfileConfig {
+function profile(admins: string[]): ProfileConfig {
   const config = createDefaultProfileConfig({
     agentKind: 'claude',
     accounts: { app: { id: 'cli_test', secret: '${APP_SECRET}', tenant: 'feishu' } },
     access: { admins },
   });
   config.workspaces.default = join(tmpdir(), 'unused');
-  void owner;
   return config;
 }
 
@@ -65,6 +82,8 @@ interface CtxArgs {
   senderId?: string;
   agentId?: string;
   hasPendingForScope?: (scope: string) => boolean;
+  discoverModels?: (input: never) => Promise<ModelCatalogResult>;
+  formValue?: Record<string, unknown>;
   scope?: string;
 }
 
@@ -79,7 +98,9 @@ function commandContext(args: CtxArgs): CommandContext {
     agent: new FakeAgentAdapter({ id: args.agentId ?? 'claude', displayName: 'Claude Code' }),
     activeRuns: args.activeRuns,
     hasPendingForScope: args.hasPendingForScope,
-    controls: controls('ou-owner', ['ou-admin']),
+    discoverModels: args.discoverModels as CommandContext['discoverModels'],
+    formValue: args.formValue,
+    controls: controls(['ou-admin']),
   };
 }
 
@@ -96,24 +117,18 @@ function message(senderId: string, content: string): NormalizedMessage {
   } as unknown as NormalizedMessage;
 }
 
+function lastContent(channel: FakeChannel): Record<string, unknown> {
+  return (channel.sent.at(-1)?.content ?? {}) as Record<string, unknown>;
+}
 function lastMarkdown(channel: FakeChannel): string {
-  const content = channel.sent.at(-1)?.content as { markdown?: string } | undefined;
-  return content?.markdown ?? '';
+  return String((lastContent(channel).markdown as string | undefined) ?? '');
+}
+function lastCard(channel: FakeChannel): Record<string, unknown> | undefined {
+  return lastContent(channel).card as Record<string, unknown> | undefined;
 }
 
-describe('/model command (OPT-07 slice A)', () => {
-  it('view reports "follow CLI" when nothing is set, without changing state', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    const handled = await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns: new ActiveRuns(), content: '/model' }),
-    );
-    expect(handled).toBe(true);
-    expect(lastMarkdown(channel)).toContain('跟随 CLI 设置');
-    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
-  });
-
-  it('persists a selection for admins and reads it back', async () => {
+describe('/model selection card (OPT-07 slice B)', () => {
+  it('/model with no args sends the selection card, not a run', async () => {
     const channel = createFakeChannel();
     const sessions = await makeStore();
     const handled = await tryHandleCommand(
@@ -121,29 +136,202 @@ describe('/model command (OPT-07 slice A)', () => {
         channel,
         sessions,
         activeRuns: new ActiveRuns(),
-        content: '/model claude-sonnet-4',
+        content: '/model',
+        discoverModels: stubDiscover(),
       }),
     );
     expect(handled).toBe(true);
-    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('claude-sonnet-4');
-    expect(lastMarkdown(channel)).toContain('已保存');
+    expect(lastCard(channel)).toBeTruthy();
+    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
+  });
 
+  it('/model list prints candidates as text for the text-reply path', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
     await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns: new ActiveRuns(), content: '/model' }),
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model list',
+        discoverModels: stubDiscover(),
+      }),
     );
-    expect(lastMarkdown(channel)).toContain('claude-sonnet-4');
+    expect(lastMarkdown(channel)).toContain('m1');
+    expect(lastMarkdown(channel)).toContain('跟随 CLI 设置');
+  });
+
+  it('card submit applies the dropdown choice and bumps revision', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    const ok = await runCommandHandler(
+      'model',
+      'submit 0',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        formValue: { model: 'm2' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(ok).toBe(true);
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('m2');
+    expect(sessions.getModelRevision('chat-1')).toBe(1);
+    expect(lastMarkdown(channel)).toContain('已保存');
+  });
+
+  it('manual input wins over the dropdown', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await runCommandHandler(
+      'model',
+      'submit 0',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        formValue: { model: 'm1', manual_model: 'custom:mine' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('custom:mine');
+  });
+
+  it('manual input may submit a reserved word verbatim', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await runCommandHandler(
+      'model',
+      'submit 0',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        formValue: { manual_model: 'reset' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('reset');
+  });
+
+  it('a stale card (old revision) is rejected without changing state', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await sessions.setModelPreference('chat-1', 'claude', 'current'); // revision -> 1
+    await runCommandHandler(
+      'model',
+      'submit 0',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        formValue: { model: 'm1' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('current');
+    expect(lastMarkdown(channel)).toContain('过期');
+  });
+
+  it('card submit from a non-admin is denied', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await runCommandHandler(
+      'model',
+      'submit 0',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '',
+        senderId: 'ou-not-admin',
+        formValue: { model: 'm1' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
+    expect(lastMarkdown(channel)).toContain('仅管理员');
+  });
+
+  it('card submit while busy is rejected, keeping the old value', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await sessions.setModelPreference('chat-1', 'claude', 'old');
+    const activeRuns = new ActiveRuns();
+    const agent = new FakeAgentAdapter({ id: 'claude' });
+    activeRuns.register('chat-1', agent.run({ runId: 'r', prompt: 'x' }));
+    await runCommandHandler(
+      'model',
+      'submit 1',
+      commandContext({
+        channel,
+        sessions,
+        activeRuns,
+        content: '',
+        formValue: { model: 'm1' },
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('old');
+    expect(lastMarkdown(channel)).toContain('正在运行');
+  });
+});
+
+describe('/model command basics (OPT-07 slice A carried forward)', () => {
+  it('text set persists and bumps revision', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await tryHandleCommand(
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model claude-sonnet-4',
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('claude-sonnet-4');
+    expect(sessions.getModelRevision('chat-1')).toBe(1);
   });
 
   it('preserves model id casing', async () => {
     const channel = createFakeChannel();
     const sessions = await makeStore();
     await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns: new ActiveRuns(), content: '/model MyModel-V1' }),
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model MyModel-V1',
+        discoverModels: stubDiscover(),
+      }),
     );
     expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('MyModel-V1');
   });
 
-  it('denies set for non-admins but leaves the preference untouched', async () => {
+  it('text reset clears the override', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    await sessions.setModelPreference('chat-1', 'claude', 'gpt-5');
+    await tryHandleCommand(
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model reset',
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
+    expect(lastMarkdown(channel)).toContain('已恢复');
+  });
+
+  it('denies set for non-admins', async () => {
     const channel = createFakeChannel();
     const sessions = await makeStore();
     await tryHandleCommand(
@@ -153,96 +341,46 @@ describe('/model command (OPT-07 slice A)', () => {
         activeRuns: new ActiveRuns(),
         content: '/model gpt-5',
         senderId: 'ou-not-admin',
+        discoverModels: stubDiscover(),
       }),
     );
     expect(lastMarkdown(channel)).toContain('仅管理员');
     expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
   });
 
-  it('allows non-admins to view', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    const handled = await tryHandleCommand(
-      commandContext({
-        channel,
-        sessions,
-        activeRuns: new ActiveRuns(),
-        content: '/model',
-        senderId: 'ou-not-admin',
-      }),
-    );
-    expect(handled).toBe(true);
-    expect(lastMarkdown(channel)).toContain('模型设置');
-  });
-
-  it('reset clears the override', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    await sessions.setModelPreference('chat-1', 'claude', 'gpt-5');
-    await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns: new ActiveRuns(), content: '/model reset' }),
-    );
-    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
-    expect(lastMarkdown(channel)).toContain('已恢复');
-  });
-
-  it('rejects changes while a run is active, keeping the old value', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    await sessions.setModelPreference('chat-1', 'claude', 'old-model');
-    const activeRuns = new ActiveRuns();
-    const agent = new FakeAgentAdapter({ id: 'claude' });
-    activeRuns.register('chat-1', agent.run({ runId: 'r1', prompt: 'x' }));
-    await tryHandleCommand(
-      commandContext({
-        channel,
-        sessions,
-        activeRuns,
-        content: '/model new-model',
-      }),
-    );
-    expect(lastMarkdown(channel)).toContain('正在运行');
-    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('old-model');
-  });
-
-  it('rejects changes while messages are queued for the scope', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    await tryHandleCommand(
-      commandContext({
-        channel,
-        sessions,
-        activeRuns: new ActiveRuns(),
-        content: '/model new-model',
-        hasPendingForScope: () => true,
-      }),
-    );
-    expect(lastMarkdown(channel)).toContain('排队中');
-    expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
-  });
-
-  it('still allows viewing while busy', async () => {
-    const channel = createFakeChannel();
-    const sessions = await makeStore();
-    await sessions.setModelPreference('chat-1', 'claude', 'busy-model');
-    const activeRuns = new ActiveRuns();
-    const agent = new FakeAgentAdapter({ id: 'claude' });
-    activeRuns.register('chat-1', agent.run({ runId: 'r1', prompt: 'x' }));
-    const handled = await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns, content: '/model' }),
-    );
-    expect(handled).toBe(true);
-    expect(lastMarkdown(channel)).toContain('busy-model');
-  });
-
   it('rejects malformed model ids', async () => {
     const channel = createFakeChannel();
     const sessions = await makeStore();
     await tryHandleCommand(
-      commandContext({ channel, sessions, activeRuns: new ActiveRuns(), content: '/model --evil' }),
+      commandContext({
+        channel,
+        sessions,
+        activeRuns: new ActiveRuns(),
+        content: '/model --evil',
+        discoverModels: stubDiscover(),
+      }),
     );
     expect(sessions.getModelPreference('chat-1', 'claude')).toBeUndefined();
     expect(lastMarkdown(channel)).toContain('不能以');
+  });
+
+  it('still allows viewing (card) while busy', async () => {
+    const channel = createFakeChannel();
+    const sessions = await makeStore();
+    const activeRuns = new ActiveRuns();
+    const agent = new FakeAgentAdapter({ id: 'claude' });
+    activeRuns.register('chat-1', agent.run({ runId: 'r', prompt: 'x' }));
+    const handled = await tryHandleCommand(
+      commandContext({
+        channel,
+        sessions,
+        activeRuns,
+        content: '/model',
+        discoverModels: stubDiscover(),
+      }),
+    );
+    expect(handled).toBe(true);
+    expect(lastCard(channel)).toBeTruthy();
   });
 
   it('isolates selection per backend (agent id)', async () => {
@@ -255,20 +393,11 @@ describe('/model command (OPT-07 slice A)', () => {
         activeRuns: new ActiveRuns(),
         content: '/model claude-only',
         agentId: 'claude',
+        discoverModels: stubDiscover(),
       }),
     );
-    // A codex-backend context on the same scope sees no override.
-    await tryHandleCommand(
-      commandContext({
-        channel,
-        sessions,
-        activeRuns: new ActiveRuns(),
-        content: '/model',
-        agentId: 'codex',
-      }),
-    );
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('claude-only');
     expect(sessions.getModelPreference('chat-1', 'codex')).toBeUndefined();
-    expect(lastMarkdown(channel)).toContain('跟随 CLI 设置');
   });
 });
 

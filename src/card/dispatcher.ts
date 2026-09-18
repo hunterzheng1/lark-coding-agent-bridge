@@ -154,6 +154,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
       agent: deps.agent,
       processPool: deps.processPool,
       runExecutor: deps.runExecutor,
+      hasPendingForScope: (pendingScope) => deps.pending.has(pendingScope),
       controls: deps.controls,
       formValue,
       fromCardAction: true,

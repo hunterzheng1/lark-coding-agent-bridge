@@ -130,6 +130,7 @@ export function statusCard(info: StatusInfo): object {
     actions([
       { text: '🆕 新会话', value: { cmd: 'new' }, style: 'primary' },
       { text: '🔁 恢复会话', value: { cmd: 'resume' } },
+      { text: '🧠 切换模型', value: { cmd: 'model.open' } },
       { text: '📂 工作目录', value: { cmd: 'ws.list' } },
       { text: '💡 帮助', value: { cmd: 'help' } },
     ]),

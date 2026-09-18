@@ -28,6 +28,10 @@ export interface SessionEntry {
    * CLI's own resolution (no `--model` passed). Preserved across /new and
    * /resume like idleTimeoutMinutes. */
   modelPreferences?: Record<string, ModelPreference>;
+  /** OPT-07 Slice B: monotonic per-scope counter bumped on every model
+   * preference write. Selection cards bind it so a stale card cannot
+   * overwrite a newer choice. */
+  modelRevision?: number;
 }
 
 type SessionMap = Record<string, SessionEntry>;
@@ -60,6 +64,8 @@ export class SessionStore {
         const lastRunOutput =
           typeof entry.lastRunOutput === 'string' ? entry.lastRunOutput : undefined;
         const modelPreferences = parseModelPreferences(entry.modelPreferences);
+        const modelRevision =
+          typeof entry.modelRevision === 'number' ? entry.modelRevision : undefined;
         const hasSession = sessionId !== undefined && cwd !== undefined;
         if (
           !hasSession &&
@@ -76,6 +82,7 @@ export class SessionStore {
           ...(idleTimeoutMinutes !== undefined ? { idleTimeoutMinutes } : {}),
           ...(lastRunOutput !== undefined ? { lastRunOutput } : {}),
           ...(modelPreferences !== undefined ? { modelPreferences } : {}),
+          ...(modelRevision !== undefined ? { modelRevision } : {}),
         };
       }
     } catch (err) {
@@ -115,6 +122,7 @@ export class SessionStore {
       ...(prev?.modelPreferences !== undefined
         ? { modelPreferences: prev.modelPreferences }
         : {}),
+      ...(prev?.modelRevision !== undefined ? { modelRevision: prev.modelRevision } : {}),
     };
     this.schedulePersist();
   }
@@ -124,21 +132,23 @@ export class SessionStore {
     if (!prev) return;
     // /new clears the resumable session (sessionId/cwd) and last-run output,
     // but keeps per-scope preferences: idle-timeout override and the OPT-07
-    // model preference.
-    const kept: SessionEntry = {
+    // model preference + revision.
+    const keepModel = prev.modelPreferences !== undefined || prev.modelRevision !== undefined;
+    if (prev.idleTimeoutMinutes === undefined && !keepModel) {
+      delete this.data[chatId];
+      this.schedulePersist();
+      return;
+    }
+    this.data[chatId] = {
       ...(prev.idleTimeoutMinutes !== undefined
         ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
         : {}),
       ...(prev.modelPreferences !== undefined
         ? { modelPreferences: prev.modelPreferences }
         : {}),
+      ...(prev.modelRevision !== undefined ? { modelRevision: prev.modelRevision } : {}),
       updatedAt: Date.now(),
     };
-    if (prev.idleTimeoutMinutes === undefined && prev.modelPreferences === undefined) {
-      delete this.data[chatId];
-    } else {
-      this.data[chatId] = kept;
-    }
     this.schedulePersist();
   }
 
@@ -189,6 +199,11 @@ export class SessionStore {
     return this.data[chatId]?.modelPreferences?.[agentId];
   }
 
+  /** OPT-07 Slice B: current per-scope model revision (0 when never written). */
+  getModelRevision(chatId: string): number {
+    return this.data[chatId]?.modelRevision ?? 0;
+  }
+
   /**
    * Save the model override and wait until it is durably on disk before
    * resolving (rule: acknowledge success only after persistence). On write
@@ -202,6 +217,7 @@ export class SessionStore {
         ...(prev?.modelPreferences ?? {}),
         [agentId]: { model, savedAt: Date.now() },
       },
+      modelRevision: (prev?.modelRevision ?? 0) + 1,
       updatedAt: Date.now(),
     };
     await this.commitPreference(chatId, prev, next);
@@ -223,6 +239,7 @@ export class SessionStore {
     const next: SessionEntry = {
       ...rest,
       ...(Object.keys(remaining).length > 0 ? { modelPreferences: remaining } : {}),
+      modelRevision: (prev.modelRevision ?? 0) + 1,
       updatedAt: Date.now(),
     };
     await this.commitPreference(chatId, prev, next);
