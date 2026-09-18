@@ -91,6 +91,12 @@
 
 1. **停机改为「显式取消 + 等真正落定」，废除固定 3s 排空上限**：四轮方案的 `disconnect` 有界排空（3s/100ms 轮询）只是把风险窗口挪了位置——媒体解析、引用获取、话题上下文等 spawn 前网络等待完全可能超 3s，超时后仍会 flush 并返回，进程退出即丢失该批次的后续状态写入。现 `startChannel` 持有 `shutdown: AbortController`，`disconnect` 在 `cancelAll` 后立即 `abort()`；新增 `raceShutdown(signal, label, promise)` 竞态辅助，包装全部 **spawn 前** 上游等待（chat 模式解析、`media.resolve`、`fetchQuotedContext` 循环、prompt 内 `fetchTopicContext`），并在 `startRunFlow` 前加同步 abort 守卫。被取消的批次从未 spawn，其 journal 记录保持 queued（本地认领/终态写入不参与竞态、必被等待），下次启动按「从未派发」语义安全重放。排空截止改为 `agentStopGraceMs + 10s`，仅作病态兜底（如卡死的本地写入），触发时 `log.warn('disconnect','drain-timeout')` 显式告警而非静默提前 flush。新增受控测试：门控认领停 4.2s（超旧 3s 上限）→ `disconnect` 实际等待至记录落 terminal/rejected 才返回；`fetchRawMessage` 无限挂起 → abort 后 `disconnect` 立即返回、记录保持 queued 且无运行。
 
+### 评审六轮修复（2026-09-18）
+
+1. **排空超时不再提前 flush/返回（P1）**：五轮的 `grace+10s` 截止超时后仍会告警并继续 flush 返回——若卡住的恰是 journal/terminal writer，仍是「flush 后继续写入 → 进程退出 → 状态丢失」的窗口。现排空**无提前返回截止**：`disconnect` 在 `pendingSettles` 清空前绝不 flush/返回；原阈值降级为纯观测项（新 `drain-stuck` 按周期重复告警，`shutdownDrainWarnMs` 可注入，默认 grace+10s）。真卡死时停机阻塞交由外部强杀，落回 journal 既有崩溃恢复语义（claimed→uncertain 不自动重跑、queued→重放）。新增测试：300ms 告警阈值 + 1.5s 门控认领 → 断言 `drain-stuck` 触发且 `disconnect` 仍等到记录落 terminal/rejected 才返回。
+2. **被放弃的底层任务纳入生命周期跟踪（P2）**：SDK 的 REST/下载接口不接受 AbortSignal，`raceShutdown` 只能让调用方跳出、底层 Promise 仍会执行（媒体下载重命名、缓存清理等副作用）。现 `raceShutdown` 增加 `trackAbandoned`（传入 `trackSettle`）：abort 时把底层任务登记进排空集合，停机等到其副作用真正结束才 flush/返回，杜绝进程内重启后旧实例继续改共享媒体缓存。对应测试改为 `fetchRawMessage` 700ms 后落定 → `disconnect` 等待该任务结束（耗时 ≥500ms）才返回、记录保持 queued。
+3. **正常停机取消不再进错误遥测（P2）**：`bridge-shutdown:*` 以普通 Error 抛出会被 flush 的 `log.fail` 记成 `✗ [flush.fail]`（error 级、入 telemetry）。现引入专门类型 `BridgeShutdownCancelled`（含 label，pre-spawn 守卫同用它），flush catch 命中时按 `log.info('flush','cancelled-by-shutdown')` 记录；测试断言取消路径零 `log.fail`、出现 info 级取消事件。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
