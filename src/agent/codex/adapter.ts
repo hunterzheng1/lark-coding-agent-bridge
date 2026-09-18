@@ -97,6 +97,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: opts.cwd,
       sandbox: opts.sandbox ?? this.sandbox,
       threadId: opts.threadId,
+      model: opts.model,
       images: opts.images,
       ignoreUserConfig: this.ignoreUserConfig,
       ignoreRules: this.ignoreRules,
@@ -118,6 +119,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: opts.cwd,
       hasThread: Boolean(opts.threadId),
       promptChars: opts.prompt.length,
+      model: opts.model,
       images: opts.images?.length ?? 0,
     });
 

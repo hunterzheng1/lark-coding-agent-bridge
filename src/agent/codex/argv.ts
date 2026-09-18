@@ -4,6 +4,7 @@ export interface BuildCodexArgsInput {
   cwd: string;
   sandbox: SandboxMode;
   threadId?: string;
+  model?: string;
   images?: readonly string[];
   ignoreUserConfig?: boolean;
   ignoreRules?: boolean;
@@ -30,6 +31,10 @@ export function buildCodexArgs(input: BuildCodexArgsInput): string[] {
     '--skip-git-repo-check',
     '-C',
     input.cwd,
+    // `--model` is a global exec flag upstream, so it sits before the `resume`
+    // subcommand and covers both the fresh and the resumed path. The id is a
+    // discrete argv element (never shell-concatenated).
+    ...(input.model ? ['--model', input.model] : []),
   ];
 
   const imageFlags = (input.images ?? []).flatMap((path) => ['--image', path]);

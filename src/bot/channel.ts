@@ -38,7 +38,7 @@ import {
   type StreamingCardSession,
 } from '../card/streaming-session';
 import { renderText } from '../card/text-renderer';
-import { tryHandleCommand, type Controls } from '../commands';
+import { commandKeepsPendingQueue, tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -911,11 +911,16 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     }),
     runExecutor: executor,
     processPool: pool,
+    hasPendingForScope: (pendingScope) => pending.has(pendingScope),
     controls,
   });
   if (handled) {
-    const dropped = pending.cancel(scope);
-    log.info('intake', 'command', { scope, droppedPending: dropped.length });
+    if (commandKeepsPendingQueue(routedMessage.content)) {
+      log.info('intake', 'command-keep-queue', { scope });
+    } else {
+      const dropped = pending.cancel(scope);
+      log.info('intake', 'command', { scope, droppedPending: dropped.length });
+    }
     return;
   }
 
@@ -1104,6 +1109,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     ...(threadId ? { threadId } : {}),
   };
   const capability = capabilityForAgentKind(controls.profileConfig.agentKind, controls.profileConfig);
+  // OPT-07: resolve the persisted model override for this scope + backend at
+  // dispatch time. Modifications are rejected while this scope is busy, so
+  // reading here reflects the value intended for this batch (undefined = the
+  // CLI resolves its own model).
+  const scopeModel = sessions.getModelPreference(scope, capability.agentId)?.model;
   // OPT-04 重头重做: a redo record may carry a resetSession intent. Execute it
   // here — before startRunFlow resolves resume state and before the pre-spawn
   // claim — so both the live-flush path and a crash replay reset the scope
@@ -1191,6 +1201,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     workspaces,
     executor,
     now: Date.now(),
+    model: scopeModel,
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,

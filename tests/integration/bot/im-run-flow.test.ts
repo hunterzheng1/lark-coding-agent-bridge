@@ -100,6 +100,43 @@ describe('IM run flow', () => {
     expect(h.agent.runOptions[0]?.cwd).toBe(workspaceRealpath);
   });
 
+  it('forwards the scope model override to the agent, and omits it when unset', async () => {
+    const withHarness = await createHarness({ defaultWorkspace: true });
+    const withModel = await startRunFlow({
+      scopeId: 'chat-1',
+      scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'hello',
+      attachments: [],
+      access: { ok: true, reason: 'allowed-user' },
+      capability: claudeCapability(withHarness.profileConfig),
+      profileConfig: withHarness.profileConfig,
+      sessions: withHarness.sessions,
+      workspaces: withHarness.workspaces,
+      executor: withHarness.executor,
+      now: 1000,
+      model: 'claude-sonnet-4',
+    });
+    expect(withModel.ok).toBe(true);
+    expect(withHarness.agent.runOptions[0]?.model).toBe('claude-sonnet-4');
+
+    const withoutHarness = await createHarness({ defaultWorkspace: true });
+    const withoutModel = await startRunFlow({
+      scopeId: 'chat-1',
+      scope: { source: 'im', chatId: 'chat-1', actorId: 'ou_user' },
+      prompt: 'hello',
+      attachments: [],
+      access: { ok: true, reason: 'allowed-user' },
+      capability: claudeCapability(withoutHarness.profileConfig),
+      profileConfig: withoutHarness.profileConfig,
+      sessions: withoutHarness.sessions,
+      workspaces: withoutHarness.workspaces,
+      executor: withoutHarness.executor,
+      now: 1000,
+    });
+    expect(withoutModel.ok).toBe(true);
+    expect(withoutHarness.agent.runOptions[0]?.model).toBeUndefined();
+  });
+
 });
 
 async function createHarness(options: { defaultWorkspace?: boolean } = {}): Promise<{

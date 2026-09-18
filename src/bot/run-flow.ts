@@ -38,6 +38,12 @@ export interface StartRunFlowInput {
   now: number;
   stopGraceMs?: number;
   /**
+   * OPT-07: bridge model override resolved from the scope's persisted
+   * preference at dispatch time. Forwarded verbatim to the executor; `undefined`
+   * means "follow the CLI's own model resolution" (no `--model`).
+   */
+  model?: string;
+  /**
    * OPT-04: called after policy approval, immediately before executor.submit.
    * Throw to abort the run before any agent spawns — used by the inbound
    * journal to claim the batch atomically; if the claim cannot be persisted,
@@ -203,6 +209,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       policy: effectivePolicy,
       sessionId,
       threadId,
+      model: input.model,
       images:
         input.capability.agentId === 'codex'
           ? policy.attachments

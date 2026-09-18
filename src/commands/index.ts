@@ -135,6 +135,13 @@ export interface CommandContext {
   activeRuns: ActiveRuns;
   processPool?: ProcessPool;
   runExecutor?: RunExecutor;
+  /**
+   * OPT-07: reports whether the scope currently has messages sitting in the
+   * PendingQueue (not yet flushed). `/model` uses it, together with
+   * activeRuns, to reject preference changes while a scope is busy. Optional
+   * so card-synthesized contexts (which never queue) can omit it.
+   */
+  hasPendingForScope?: (scope: string) => boolean;
   controls: Controls;
   codexHistoryProvider?: (
     options: ListCodexThreadHistoryOptions,
@@ -186,7 +193,24 @@ const handlers: Record<string, Handler> = {
   '/doc': handleDoc,
   '/invite': handleInvite,
   '/remove': handleRemove,
+  '/model': handleModel,
 };
+
+/**
+ * Commands that are handled without disturbing the scope's PendingQueue.
+ * `/model` inspects and edits a persisted preference; it must never drop
+ * already-received messages, so the channel keeps the queue intact for these.
+ */
+const QUEUE_PRESERVING_COMMANDS = new Set(['/model']);
+
+/** Whether handling this slash-command text must leave the pending queue
+ * untouched (vs. the default of cancelling it, as the other commands do). */
+export function commandKeepsPendingQueue(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith('/')) return false;
+  const cmd = trimmed.split(/\s+/)[0] ?? '';
+  return QUEUE_PRESERVING_COMMANDS.has(cmd);
+}
 
 /**
  * Commands that can mutate credentials, lifecycle, filesystem reach, or
@@ -476,6 +500,131 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
 async function handleDoc(args: string, ctx: CommandContext): Promise<void> {
   void args;
   await reply(ctx, '云文档评论现在不需要绑定工作区；在支持的文档评论里 @bot 即可触发回复。');
+}
+
+// ─── /model (OPT-07 slice A: command closed loop) ──────────────────────────
+
+const MODEL_ID_MAX_LEN = 120;
+
+async function handleModel(args: string, ctx: CommandContext): Promise<void> {
+  const agentId = ctx.agent.id;
+  const input = args.trim();
+
+  // `/model` with no argument: view the current selection. Read-only, so it is
+  // allowed for anyone who passed the access gate and never touches the queue.
+  if (!input) {
+    await reply(ctx, modelViewText(ctx, agentId));
+    return;
+  }
+
+  const tokens = input.split(/\s+/);
+  const firstRaw = tokens[0] ?? '';
+  const first = firstRaw.toLowerCase();
+
+  if (first === 'refresh') {
+    // Candidate discovery ships with a later slice; keep the surface honest.
+    await reply(
+      ctx,
+      '🧠 候选模型列表发现尚未支持（后续版本提供）。当前可直接使用 `/model <模型 ID>` 指定，或 `/model reset` 恢复跟随 CLI 设置。',
+    );
+    return;
+  }
+
+  // Set and reset mutate the scope preference. Default policy: only the bot
+  // owner / admins may change what every member's next task runs on (rule 2).
+  const admin = canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
+  if (!admin.ok) {
+    await reply(ctx, '❌ 切换/恢复模型仅管理员或 bot owner 可用；查看请使用 `/model`。');
+    return;
+  }
+
+  // Slice A rejects busy-time edits instead of snapshotting in-flight work.
+  const busy = modelBusyReason(ctx);
+  if (busy) {
+    await reply(
+      ctx,
+      `⚠️ ${busy}现在修改会让排队中的消息落到不确定的模型上，请等当前任务处理完再试。查看设置请用 \`/model\`。`,
+    );
+    return;
+  }
+
+  if (first === 'reset') {
+    let cleared: boolean | null;
+    try {
+      cleared = await ctx.sessions.clearModelPreference(ctx.scope, agentId);
+    } catch {
+      cleared = null;
+    }
+    if (cleared === null) {
+      await reply(ctx, '❌ 保存失败，已保留原模型设置。');
+      return;
+    }
+    await reply(
+      ctx,
+      cleared
+        ? '✓ 已恢复：此后收到的消息跟随 CLI 设置（不再传 `--model`）。'
+        : '当前本来就没有模型覆盖，仍跟随 CLI 设置。',
+    );
+    return;
+  }
+
+  const validation = validateModelId(firstRaw);
+  if (!validation.ok) {
+    await reply(ctx, `❌ ${validation.reason}\n\n用法：\`/model <模型 ID>\` · \`/model reset\``);
+    return;
+  }
+  try {
+    await ctx.sessions.setModelPreference(ctx.scope, agentId, validation.modelId);
+  } catch {
+    await reply(ctx, '❌ 保存失败，已保留原模型设置。');
+    return;
+  }
+  await reply(
+    ctx,
+    `✓ 已保存：${validation.modelId}，此后收到的消息使用该设置。\n不会中断当前任务，也不会清空队列。`,
+  );
+}
+
+function modelViewText(ctx: CommandContext, agentId: string): string {
+  const pref = ctx.sessions.getModelPreference(ctx.scope, agentId);
+  return [
+    `🧠 模型设置 · ${ctx.agent.displayName}`,
+    `作用范围：${modelScopeLabel(ctx.chatMode)}`,
+    pref ? `当前选择：${pref.model}` : '当前选择：跟随 CLI 设置（未覆盖）',
+    `上次保存：${pref ? formatRelTime(pref.savedAt) : '—'}`,
+    '',
+    '用法：`/model <模型 ID>` 指定 · `/model reset` 恢复跟随 CLI 设置',
+    '_切换不会中断当前任务，也不清空队列；新设置对之后收到的消息生效。_',
+  ].join('\n');
+}
+
+function modelScopeLabel(chatMode: 'p2p' | 'group' | 'topic'): string {
+  if (chatMode === 'topic') return '当前话题（同话题成员共享）';
+  if (chatMode === 'group') return '当前群（成员共享）';
+  return '当前私聊';
+}
+
+function modelBusyReason(ctx: CommandContext): string | undefined {
+  if (ctx.activeRuns.get(ctx.scope)) return '当前会话有任务正在运行。';
+  if (ctx.hasPendingForScope?.(ctx.scope)) return '当前会话有排队中的消息尚未处理。';
+  return undefined;
+}
+
+function validateModelId(
+  raw: string,
+): { ok: true; modelId: string } | { ok: false; reason: string } {
+  const modelId = raw.trim();
+  if (!modelId) return { ok: false, reason: '模型 ID 为空。' };
+  if (modelId.length > MODEL_ID_MAX_LEN) {
+    return { ok: false, reason: `模型 ID 过长（最多 ${MODEL_ID_MAX_LEN} 个字符）。` };
+  }
+  if (/[\s\u0000-\u001f\u007f]/.test(modelId)) {
+    return { ok: false, reason: '模型 ID 不能包含空格或控制字符。' };
+  }
+  if (modelId.startsWith('-')) {
+    return { ok: false, reason: '模型 ID 不能以 `-` 开头。' };
+  }
+  return { ok: true, modelId };
 }
 
 const WORKSPACE_NAME_SEPARATOR = '\u001f';
@@ -830,6 +979,7 @@ async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' 
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
   const cwd = effectiveWorkspaceCwd(ctx);
   const sess = ctx.sessions.getRaw(ctx.scope);
+  const modelPref = ctx.sessions.getModelPreference(ctx.scope, ctx.agent.id);
   const isCodex = ctx.controls.profileConfig.agentKind === 'codex';
   const catalogEntry =
     isCodex && ctx.sessionCatalog && ctx.sessionCatalogIdentity
@@ -850,6 +1000,10 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
+    model: {
+      value: modelPref?.model,
+      source: modelPref ? 'override' : 'cli',
+    },
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, { replyTo: ctx.msg.messageId });
 }

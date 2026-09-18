@@ -118,4 +118,50 @@ describe('Codex argv contract', () => {
     ).toContain('--ignore-user-config');
   });
 
+  it('carries the model as a discrete global flag on a fresh exec', () => {
+    const argv = buildCodexArgs({
+      cwd: '/repo',
+      sandbox: 'workspace-write',
+      model: 'gpt-5',
+    });
+    expect(argv).toEqual([
+      'exec',
+      '--json',
+      '--sandbox',
+      'workspace-write',
+      '-c',
+      'approval_policy="never"',
+      '-c',
+      'shell_environment_policy.inherit="all"',
+      '--ignore-rules',
+      '--skip-git-repo-check',
+      '-C',
+      '/repo',
+      '--model',
+      'gpt-5',
+      '-',
+    ]);
+  });
+
+  it('carries the model as a global flag before the resume subcommand', () => {
+    const argv = buildCodexArgs({
+      cwd: '/repo',
+      sandbox: 'workspace-write',
+      threadId: 'thread-123',
+      model: 'gpt-5-mini',
+    });
+    const modelIndex = argv.indexOf('--model');
+    const resumeIndex = argv.indexOf('resume');
+    expect(modelIndex).toBeGreaterThan(-1);
+    expect(argv[modelIndex + 1]).toBe('gpt-5-mini');
+    expect(resumeIndex).toBeGreaterThan(-1);
+    // Global flag must precede the subcommand so resume inherits it.
+    expect(modelIndex).toBeLessThan(resumeIndex);
+  });
+
+  it('omits the model entirely when no override is set', () => {
+    expect(
+      buildCodexArgs({ cwd: '/repo', sandbox: 'read-only' }),
+    ).not.toContain('--model');
+  });
 });

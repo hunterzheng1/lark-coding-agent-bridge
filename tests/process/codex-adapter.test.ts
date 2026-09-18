@@ -204,6 +204,47 @@ describe('CodexAdapter process contract', () => {
     expect(record.argv).toEqual(buildCodexArgs({ cwd, sandbox: 'read-only' }));
   });
 
+  it('forwards the run model override into the Codex argv (fresh and resume)', async () => {
+    const fake = await createFakeCodex({
+      lines: [{ type: 'turn.completed' }],
+    });
+    cleanup.push(fake.dir);
+    const cwd = await realpath(fake.dir);
+
+    const fresh = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      sandbox: 'workspace-write',
+    }).run({
+      runId: 'run-model-fresh',
+      prompt: 'hi',
+      cwd,
+      model: 'gpt-5',
+    });
+    await collect(fresh.events);
+    const freshRecord = await readRecord(fake.recordPath);
+    expect(freshRecord.argv).toEqual(buildCodexArgs({ cwd, sandbox: 'workspace-write', model: 'gpt-5' }));
+    expect(freshRecord.argv).toContain('--model');
+
+    const resumed = new CodexAdapter({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      sandbox: 'workspace-write',
+    }).run({
+      runId: 'run-model-resume',
+      prompt: 'again',
+      cwd,
+      threadId: 'thread-abc',
+      model: 'gpt-5',
+    });
+    await collect(resumed.events);
+    const resumeRecord = await readRecord(fake.recordPath);
+    expect(resumeRecord.argv).toEqual(
+      buildCodexArgs({ cwd, sandbox: 'workspace-write', threadId: 'thread-abc', model: 'gpt-5' }),
+    );
+    expect(resumeRecord.argv.indexOf('--model')).toBeLessThan(resumeRecord.argv.indexOf('resume'));
+  });
+
   it('honors a profile-configured Codex home', async () => {
     const fake = await createFakeCodex({
       lines: [{ type: 'turn.completed' }],

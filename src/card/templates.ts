@@ -81,6 +81,11 @@ export interface StatusInfo {
   scope: string;
   /** Chat mode — used to label scope. */
   chatMode: 'p2p' | 'group' | 'topic';
+  /** OPT-07: model selection state for this scope + backend. `value` is the
+   * bridge override when set; `source: 'cli'` means no override is stored and
+   * the CLI resolves its own model. This is the *selection*, not a model the
+   * upstream reported actually running. */
+  model?: { value?: string; source: 'override' | 'cli' };
 }
 
 export function statusCard(info: StatusInfo): object {
@@ -97,12 +102,17 @@ export function statusCard(info: StatusInfo): object {
   const queueLine = info.queue
     ? `${info.queue.active}/${info.queue.cap} active, ${info.queue.waiting} waiting`
     : 'unknown';
+  const modelLine =
+    info.model?.source === 'override' && info.model.value
+      ? `${escapeMd(info.model.value)} _（桥接覆盖，此后消息生效）_`
+      : '跟随 CLI 设置';
   const lines = [
     `🧭 **scope**: ${scopeLine}`,
     `🧩 **profile**: ${escapeMd(info.profileName)}`,
     `📁 **cwd**: ${cwdLine}`,
     `🔗 **session**: ${sessionLine}`,
     `🤖 **agent**: ${escapeMd(info.agentName)}`,
+    `🧠 **model**: ${modelLine}`,
     `🛡 **${escapeMd(info.runtimeAccess.label)}**: ${escapeMd(info.runtimeAccess.value)}`,
     ...(info.larkCliStatus ? [`🔐 **lark-cli**: ${info.larkCliStatus}`] : []),
     `🏃 **active run**: ${info.activeRun ? 'yes' : 'no'}`,
@@ -191,6 +201,7 @@ export function helpCard(agentName = 'Agent'): object {
         '- `/timeout [N|off|default]` — 当前 session 的探活分钟数,`/config` 改全局默认',
         '- `/timeout comment:<scopeHash> N` — 管理员设置云文档评论任务探活',
         '- `/thinking [runId] [页]` — 查看运行保存的完整思考记录（分页）',
+        '- `/model` — 查看当前 Agent 的模型选择；`/model <模型 ID>` 指定；`/model reset` 恢复跟随 CLI 设置（作用于当前会话/话题，仅管理员可改）',
         '- `/ps` — 列出本机所有 bot,标识当前正在回复的那个',
         '- `/exit <id|#>` — 关掉指定 bot(用 `/ps` 看 id/序号)',
         '- `/reconnect` — 强制重连 WebSocket(网络抖动后 bot 没反应时用)',
