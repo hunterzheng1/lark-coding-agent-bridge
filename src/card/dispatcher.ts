@@ -163,6 +163,15 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     const sub = rest.join(' ');
     const args = composeArgs(sub, payload);
 
+    // 评审九轮 P2: commandSessionCatalogIdentity above is the last await
+    // before the command runs. Built-in commands carry side effects (/new,
+    // workspace switch, restart) that must not execute across the shutdown
+    // boundary — re-check the signal before handing off.
+    if (deps.shutdownSignal?.aborted) {
+      log.info('cardAction', 'command-skipped-by-shutdown', { cmd, scope });
+      return;
+    }
+
     try {
       const ok = await runCommandHandler(name ?? '', args, ctx);
       if (!ok) log.warn('cardAction', 'unknown', { cmd });
@@ -304,6 +313,20 @@ async function handleInboundRecoveryAction(
       const stillActionable =
         rec && (rec.status === 'uncertain' || rec.status === 'expired');
       return stillActionable ? 'retry' : 'settled';
+    }
+    if (deps.shutdownSignal?.aborted) {
+      // 评审九轮 P1: disconnect can begin while redo is persisting — the
+      // pre-redo gate has already passed by then. Pushing now would arm a
+      // fresh debounce timer on the instance that is about to return from
+      // disconnect. Leave the new record queued (never dispatched → the
+      // next startup replays it) and stop without dispatching.
+      log.info('inbound', 'recovery-push-skipped-by-shutdown', {
+        scope: input.scope,
+        messageId: input.messageId,
+        newMessageId: newId,
+        action: input.cmd,
+      });
+      return 'skipped';
     }
     const m = recoveryMessageFrom(record, newId);
     const synthetic: NormalizedMessage = {

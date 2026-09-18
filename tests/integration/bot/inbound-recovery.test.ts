@@ -360,6 +360,22 @@ class GatedClaimJournal extends InboundJournal {
   }
 }
 
+/** Journal whose redo can be parked mid-persistence, so tests can start
+ * disconnect strictly while the redo write is still in flight (评审九轮). */
+class GatedRedoJournal extends InboundJournal {
+  redoReached = false;
+  gate: Promise<void> | undefined;
+  override async redo(
+    scope: string,
+    messageId: string,
+    opts?: { contentOverride?: string; senderId?: string; resetSession?: boolean },
+  ): Promise<string | undefined> {
+    this.redoReached = true;
+    if (this.gate) await this.gate;
+    return super.redo(scope, messageId, opts);
+  }
+}
+
 describe('重头重做 resetSession 意图（评审四轮）', () => {
   it('disconnect covers a batch parked in the pre-spawn claim (no tracking dead zone)', async () => {
     const dir = await mkdtempInbound();
@@ -708,6 +724,65 @@ describe('回调与恢复通知纳入排空跟踪（评审八轮）', () => {
     expect(h.journal.list('oc_dm')).toHaveLength(1);
     expect(h.journal.getRecord('oc_dm', 'om_uncertain')?.status).toBe('uncertain');
     await new Promise((r) => setTimeout(r, 900)); // past any debounce window
+    expect(h.agent.runs).toHaveLength(0);
+    expect(
+      h.channel.sent.some((s) => markdownOf(s)?.includes('已在原会话提交继续请求')),
+    ).toBe(false);
+  }, 20_000);
+});
+
+describe('停机期间恢复动作不再重建派发定时器（评审九轮）', () => {
+  it('a disconnect during journal.redo leaves the redo record queued and never dispatches', async () => {
+    const dir = await mkdtempInbound();
+    const journal = new GatedRedoJournal(dir);
+    await journal.recordAccepted({
+      messageId: 'om_uncertain',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'redo race bait',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await journal.markClaimed('oc_dm', ['om_uncertain'], 'run-lost');
+
+    const h = await startBridge({ journal });
+    await waitFor(
+      () => h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
+      8000,
+    );
+    h.profileConfig.access.allowedChats.push('oc_dm');
+    let release!: () => void;
+    journal.gate = new Promise<void>((r) => (release = r));
+
+    const delivered = Promise.resolve(
+      h.channel.handlers.cardAction?.({
+        chatId: 'oc_dm',
+        messageId: 'om_card',
+        operator: { openId: 'ou_user', name: 'User' },
+        action: { value: { cmd: 'inbound.continue', arg: 'om_uncertain' } },
+      }),
+    );
+    // Deterministically parked INSIDE the journal.redo persistence — the
+    // pre-redo gate has already passed at this point.
+    await waitFor(() => journal.redoReached, 8000);
+
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(release, 900);
+    await disconnecting;
+    await delivered;
+    // The tracked callback drained before disconnect returned.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(800);
+
+    // The post-redo gate fired: the fresh redo record is persisted QUEUED
+    // (never dispatched → next startup replays it) and pending.push was
+    // skipped, so no debounce timer survives on the old instance.
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm').some((rec) => rec.status === 'queued')).toBe(true);
+    expect(onDisk.getRecord('oc_dm', 'om_uncertain')?.status).toBe('terminal');
+    await new Promise((r) => setTimeout(r, 1200)); // well past the debounce window
     expect(h.agent.runs).toHaveLength(0);
     expect(
       h.channel.sent.some((s) => markdownOf(s)?.includes('已在原会话提交继续请求')),
