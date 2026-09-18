@@ -101,6 +101,11 @@
 
 1. **任务生产入口纳入生命周期跟踪并随停机关闭（P1）**：六轮后端只覆盖「已登记的批次」，但排空看到空集合即返回时，仍可能有**尚未登记的生产者**在途——①启动恢复任务独立运行，1.5s 合批握手延迟之后才 `pending.push` / 发恢复卡，完全未被跟踪；②intake 处理器在 chat mode 解析、thread lookup、命令上下文期间没有任何登记，disconnect 可能先 flush 返回，处理器随后照常写 journal（recordAccepted）并重入队。现：启动恢复任务从入口 `trackSettle`，1.5s 等待改为 `sleepUntilAbort`（abort 即醒），醒来后先查 `shutdown.signal.aborted` 再决定重放/通知（取消时记 `inbound.startup-recovery-cancelled`）；message handler 从入口 `trackSettle` 登记且已停机时直接 `intake.rejected-by-shutdown` 拒绝；`intakeMessage` 拿到 `shutdownSignal`，在 recordAccepted 前与 `pending.push` 前各设一道闸（分别记 `intake.dropped-by-shutdown` / `intake.dispatch-skipped-by-shutdown`，中断窗口内已落盘的记录保持 queued 由下次启动重放）；cardAction 与 comment 入口同样加停机拒绝闸。新增测试：1.5s 恢复宽限期内断连 → `disconnect` 快速返回且宽限期+合批过后无任何重放/恢复卡、记录仍 queued；intake 停在 `getChatMode` 门控时断连 → `disconnect` 等待该跟踪任务恢复（≥800ms）且恢复后的处理器不再写 journal、不再派发。
 
+### 评审八轮修复（2026-09-18）
+
+1. **cardAction / comment 纳入排空集合并设持久化/派发闸（P1）**：七轮只给两者加了入口拒绝闸，停机前**已进入**的回调仍未登记——回调若正停在异步操作（`resolveScope` 的 chat-mode/thread lookup、评论的目标解析与上下文拉取）中，disconnect 可能看到空排空集合并返回，回调恢复后照常写 journal、`pending.push`、发消息甚至创建/恢复 Agent 运行。现：两个 handler 与 message handler 同构，从入口 `trackSettle`；`shutdownSignal` 下传给 `handleCardAction` 与 `handleCommentMention`，在回调首个 await（`resolveScope`）之后设第一道闸（`cardAction.dropped-by-shutdown`），恢复卡动作的 `journal.redo`+`pending.push` 前设第二道闸（`inbound.recovery-dispatch-skipped-by-shutdown`，静默不派发）；评论在 `executor.submit` 派发前设闸（`comment.dispatch-skipped-by-shutdown`）。已登记闸内恢复后的反馈文本发送由 fire-and-forget 改为 await，全部落在被跟踪的回调生命周期内。
+2. **恢复通知纳入生命周期（P2）**：启动恢复任务对 uncertain/expired 卡片仍是 `void channel.send(...)`——外层任务在通知发出前就从 pendingSettles 移除，disconnect 可以完成而旧实例仍持有发送中的卡片。现每条恢复通知在已跟踪的恢复任务内 `await`（每轮循环前检查停机状态可提前 `startup-recovery-cancelled`），发送完成前 disconnect 不会返回。新增测试：恢复通知停在被门控的 `channel.send` 时断连 → disconnect 等待通知落定（≥800ms）且断连后卡片已完整发出；cardAction 停在 `getChatMode` 门控时断连 → disconnect 等待该回调恢复（≥800ms），恢复后的点击被停机闸拦截——不写 redo、不产生新记录、不派发、无成功文案，记录仍为 uncertain 待下次处理。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
