@@ -264,6 +264,23 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // unblock arms a fresh quiet-window timer. Net effect: at most one run per
   // chat in flight, and everything sent during a run merges into the next
   // batch (only flushed once 600ms of silence has passed *after* the run).
+  // OPT-04: lifecycle tracking for graceful shutdown — initialized BEFORE
+  // the pending queue because a message arriving immediately after startup
+  // can flush (and reach terminal callbacks) before connection completes.
+  // The tracker never swallows rejections: the original promise is returned.
+  const pendingSettles = new Set<Promise<unknown>>();
+  const trackSettle = (p: Promise<unknown>): Promise<unknown> => {
+    const shadow = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    const entry = shadow.finally(() => {
+      pendingSettles.delete(entry);
+    });
+    pendingSettles.add(entry);
+    return p;
+  };
+
   const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
@@ -497,20 +514,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     forceReconnect: () => controls.restart(),
   });
 
-  // OPT-04: in-flight terminal callbacks (journal settle, thinking save,
-  // completion notice) are tracked so a graceful shutdown can wait for them
-  // before flushing the stores they write to.
-  const pendingSettles = new Set<Promise<unknown>>();
-  const trackSettle = (p: Promise<unknown>): Promise<unknown> => {
-    const tracked = p
-      .catch(() => undefined)
-      .finally(() => {
-        pendingSettles.delete(tracked);
-      });
-    pendingSettles.add(tracked);
-    return tracked;
-  };
-
   return {
     channel,
     disconnect: async () => {
@@ -525,10 +528,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         activeRuns.stopAll(),
       ]);
       // Phase 2: wait (bounded) for terminal callbacks to finish writing.
-      if (pendingSettles.size > 0) {
+      // Runs registered at consumption start keep entering the set as they
+      // wind down, so drain repeatedly until empty or the deadline passes.
+      const settleDeadline = Date.now() + 3_000;
+      while (pendingSettles.size > 0 && Date.now() < settleDeadline) {
         await Promise.race([
           Promise.allSettled([...pendingSettles]),
-          new Promise((resolve) => setTimeout(resolve, 5_000)),
+          new Promise((resolve) => setTimeout(resolve, 100)),
         ]);
       }
       // Phase 3: flush every store only after all writers have settled.
@@ -787,7 +793,7 @@ interface RunBatchDeps {
   scope: string;
   mode: ChatMode;
   /** Registers in-flight terminal callbacks so shutdown can await them. */
-  trackSettle?: (p: Promise<unknown>) => Promise<unknown>;
+  trackSettle: (p: Promise<unknown>) => Promise<unknown>;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -1182,6 +1188,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           },
         },
       );
+      trackSettle(renderDone);
       try {
         try {
           activeSession = await startStreamingCardSession(
@@ -1265,6 +1272,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           },
         },
       );
+      trackSettle(renderDone);
       const sendMarkdownFallback = async (state: RunState): Promise<void> => {
         if (controls.profileConfig.agentKind === 'codex') return;
         const reply = finalReplyText(filterForPrefs(state));
@@ -1315,7 +1323,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       // the run, then post only the final reply (text after the last tool)
       // once as a plain markdown message — no card, no streaming, no
       // typewriter, no process-narration dump. `/last` recalls the full run.
-      const finalState = await processAgentStream(
+      const streamSettled = processAgentStream(
         handle,
         eventStream,
         scope,
@@ -1324,6 +1332,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async () => {},
         hooks,
       );
+      trackSettle(streamSettled);
+      const finalState = await streamSettled;
       if (controls.profileConfig.agentKind === 'codex') {
         await sendReservedFinalReply({
           channel,

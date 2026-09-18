@@ -134,7 +134,14 @@ export class InboundJournal {
       log.fail('inbound', err, { step: 'mkdir', scope: input.scope });
       return 'failed';
     }
-    return (await this.persistScope(input.scope)) ? 'recorded' : 'failed';
+    const persisted = await this.persistScope(input.scope);
+    if (!persisted) {
+      // Roll back the reservation: a failed write must not make later
+      // deliveries of the same id look like duplicates forever.
+      this.records.delete(k);
+      return 'failed';
+    }
+    return 'recorded';
   }
 
   async markClaimed(

@@ -255,7 +255,9 @@ async function handleInboundRecoveryAction(
     return;
   }
 
-  const dispatch = async (content: string): Promise<void> => {
+  const dispatch = async (
+    content: string,
+  ): Promise<'dispatched' | 'settled' | 'retry'> => {
     const newId = await journal.redo(input.scope, input.messageId, {
       contentOverride: content,
       senderId: clicker,
@@ -266,12 +268,7 @@ async function handleInboundRecoveryAction(
       const rec = journal.getRecord(input.scope, input.messageId);
       const stillActionable =
         rec && (rec.status === 'uncertain' || rec.status === 'expired');
-      send(
-        stillActionable
-          ? '⚠️ 恢复记录暂时无法写入，请稍后重试。'
-          : '该恢复记录已处理过。',
-      );
-      return;
+      return stillActionable ? 'retry' : 'settled';
     }
     const m = recoveryMessageFrom(record, newId);
     const synthetic: NormalizedMessage = {
@@ -298,6 +295,13 @@ async function handleInboundRecoveryAction(
       newMessageId: newId,
       action: input.cmd,
     });
+    return 'dispatched';
+  };
+
+  const sendOutcome = (outcome: 'dispatched' | 'settled' | 'retry', success: string): void => {
+    if (outcome === 'retry') send('⚠️ 恢复记录暂时无法写入，请稍后重试。');
+    else if (outcome === 'settled') send('该恢复记录已处理过。');
+    else send(success);
   };
 
   if (input.cmd === 'inbound.continue') {
@@ -305,8 +309,9 @@ async function handleInboundRecoveryAction(
     // there is nothing to continue — degrade to a plain dispatch.
     const content =
       record.status === 'uncertain' ? continuationPrompt(record.content) : record.content;
-    await dispatch(content);
-    send(
+    const outcome = await dispatch(content);
+    sendOutcome(
+      outcome,
       record.status === 'uncertain'
         ? '💬 已在原会话提交继续请求，agent 会先检查进度再接着做。'
         : '▶️ 该记录未曾执行，已直接提交执行。',
@@ -316,8 +321,14 @@ async function handleInboundRecoveryAction(
 
   // inbound.redo
   if (record.status === 'uncertain') {
-    // Full redo: reset the scope session (catalog entry + session store,
-    // same as /new) so the re-run cannot resume the interrupted context.
+    // Full redo: persist + enqueue the re-run FIRST — only after the task is
+    // durably queued do we reset the scope session (catalog entry + session
+    // store, same as /new). A failed write must not destroy the old session.
+    const outcome = await dispatch(record.content);
+    if (outcome !== 'dispatched') {
+      sendOutcome(outcome, '');
+      return;
+    }
     const identity = await commandSessionCatalogIdentity({
       msg: input.msg,
       scope: input.scope,
@@ -330,14 +341,13 @@ async function handleInboundRecoveryAction(
       deps.sessionCatalog?.archiveActive({ ...identity, now: Date.now() });
     }
     deps.sessions.clear(input.scope);
-    await dispatch(record.content);
     send('♻️ 已重置会话并重新提交完整任务，后续消息将在新会话中处理。');
     return;
   }
 
   // expired: nothing ever ran — plain dispatch into the current session.
-  await dispatch(record.content);
-  send('▶️ 已按原内容提交执行。');
+  const outcome = await dispatch(record.content);
+  sendOutcome(outcome, '▶️ 已按原内容提交执行。');
 }
 
 async function resolveScope(
