@@ -34,6 +34,7 @@ import { startChannel } from '../../../src/bot/channel.js';
 
 interface MessageHandlerMap {
   message?: (msg: NormalizedMessage) => Promise<void> | void;
+  cardAction?: (evt: unknown) => Promise<void> | void;
 }
 
 interface FakeLarkChannel {
@@ -49,6 +50,10 @@ interface FakeLarkChannel {
   chatModeRequested: boolean;
   /** When set, getChatMode parks on it — deterministic intake gating. */
   chatModeGate: Promise<void> | undefined;
+  /** Incremented on every send entry (before parking); tests reset to observe. */
+  sendRequested: number;
+  /** When set, send parks on it before recording — recovery-notice gating. */
+  sendGate: Promise<void> | undefined;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   createCard(cardJson: unknown): Promise<{ cardId: string }>;
   updateCardById(cardId: string, cardJson: unknown, sequence: number): Promise<void>;
@@ -235,6 +240,8 @@ function createFakeLarkChannel(): FakeLarkChannel {
     sent,
     chatModeRequested: false,
     chatModeGate: undefined,
+    sendRequested: 0,
+    sendGate: undefined,
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
       application: {
@@ -276,6 +283,8 @@ function createFakeLarkChannel(): FakeLarkChannel {
     async updateCardById() {},
     async updateCard() {},
     async send(chatId, content, options) {
+      channel.sendRequested += 1;
+      if (channel.sendGate) await channel.sendGate;
       sent.push({ chatId, content, options });
       return { messageId: `om_sent_${sent.length}` };
     },
@@ -606,6 +615,103 @@ describe('停机关闭任务生产入口（评审七轮）', () => {
     expect(onDisk.list('oc_dm')).toHaveLength(0);
     await new Promise((r) => setTimeout(r, 900)); // past any debounce window
     expect(h.agent.runs).toHaveLength(0);
+  }, 20_000);
+});
+
+describe('回调与恢复通知纳入排空跟踪（评审八轮）', () => {
+  it('disconnect waits an in-flight recovery notice instead of letting it fly untracked', async () => {
+    const dir = await mkdtempInbound();
+    const seeded = new InboundJournal(dir);
+    await seeded.recordAccepted({
+      messageId: 'om_uncertain',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'uncertain bait',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await seeded.markClaimed('oc_dm', ['om_uncertain'], 'run-lost');
+    await seeded.flush();
+
+    const h = await startBridge({ journalDir: dir });
+    let releaseSend!: () => void;
+    h.channel.sendGate = new Promise<void>((r) => (releaseSend = r));
+    h.channel.sendRequested = 0;
+    // The tracked recovery task reaches the notice send (after the 1.5s
+    // grace) and parks there. Before 评审八轮 the task did `void send` and
+    // left pendingSettles while the card was still in flight.
+    await waitFor(() => h.channel.sendRequested > 0, 8000);
+
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(releaseSend, 900);
+    await disconnecting;
+    // The drain waited for the notice to complete...
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(800);
+    // ...and by the time disconnect returned the card had fully gone out.
+    expect(
+      h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
+    ).toBe(true);
+  }, 20_000);
+
+  it('disconnect waits a gated cardAction and the resumed click stops before journaling/dispatch', async () => {
+    const dir = await mkdtempInbound();
+    const seeded = new InboundJournal(dir);
+    await seeded.recordAccepted({
+      messageId: 'om_uncertain',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'continuation bait',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await seeded.markClaimed('oc_dm', ['om_uncertain'], 'run-lost');
+    await seeded.flush();
+
+    const h = await startBridge({ journalDir: dir });
+    // Let startup recovery finish — the only producer left must be the click.
+    await waitFor(
+      () => h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
+      8000,
+    );
+    // The fake channel answers chat mode 'group' — allow the chat so the
+    // click reaches the shutdown/dispatch boundary, not the access gate.
+    h.profileConfig.access.allowedChats.push('oc_dm');
+    let releaseGate!: () => void;
+    h.channel.chatModeGate = new Promise<void>((r) => (releaseGate = r));
+    h.channel.chatModeRequested = false;
+
+    const delivered = Promise.resolve(
+      h.channel.handlers.cardAction?.({
+        chatId: 'oc_dm',
+        messageId: 'om_card',
+        operator: { openId: 'ou_user', name: 'User' },
+        action: { value: { cmd: 'inbound.continue', arg: 'om_uncertain' } },
+      }),
+    );
+    // Deterministically parked inside resolveScope's chat-mode lookup.
+    await waitFor(() => h.channel.chatModeRequested, 8000);
+
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(releaseGate, 900);
+    await disconnecting;
+    await delivered;
+
+    // cardAction is lifecycle-tracked from entry: the drain waited for the
+    // in-flight callback instead of seeing an empty set and flushing early.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(800);
+    // The resumed click hit the shutdown gate: no redo journalled, no new
+    // record, no armed dispatch, no success wording.
+    expect(h.journal.list('oc_dm')).toHaveLength(1);
+    expect(h.journal.getRecord('oc_dm', 'om_uncertain')?.status).toBe('uncertain');
+    await new Promise((r) => setTimeout(r, 900)); // past any debounce window
+    expect(h.agent.runs).toHaveLength(0);
+    expect(
+      h.channel.sent.some((s) => markdownOf(s)?.includes('已在原会话提交继续请求')),
+    ).toBe(false);
   }, 20_000);
 });
 

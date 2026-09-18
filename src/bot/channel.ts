@@ -382,12 +382,20 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           pending.push(record.scope, recoveryMessage(record));
         }
         for (const record of recovery.uncertain) {
+          // 评审八轮: the notice is part of the recovery task — await it (the
+          // task itself is lifecycle-tracked) so disconnect can never return
+          // while the old instance is still mid-send. `void send` let the
+          // outer task leave pendingSettles before the card went out.
+          if (shutdown.signal.aborted) {
+            log.info('inbound', 'startup-recovery-cancelled', { stage: 'notice' });
+            return;
+          }
           log.warn('inbound', 'recovery-uncertain', {
             scope: record.scope,
             messageId: record.messageId,
             runId: record.runId,
           });
-          void channel
+          await channel
             .send(
               record.chatId,
               {
@@ -402,7 +410,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             .catch((err) => log.fail('inbound', err, { step: 'recovery-notice' }));
         }
         for (const record of recovery.expired) {
-          void channel
+          if (shutdown.signal.aborted) {
+            log.info('inbound', 'startup-recovery-cancelled', { stage: 'notice' });
+            return;
+          }
+          await channel
             .send(
               record.chatId,
               {
@@ -467,50 +479,59 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     },
     cardAction: async (evt) => {
       // Producer entry: card callbacks can journal/claim/dispatch — refuse
-      // them wholesale once shutdown started (评审七轮).
+      // them wholesale once shutdown started (评审七轮), and lifecycle-track
+      // the ones already in flight from entry so disconnect drains them
+      // instead of returning mid-callback (评审八轮 P1).
       if (shutdown.signal.aborted) {
         log.info('cardAction', 'rejected-by-shutdown', { messageId: evt.messageId });
         return;
       }
-      await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
-        await handleCardAction({
-          channel,
-          evt,
-          sessions,
-          sessionCatalog,
-          workspaces,
-          thinkingHistory,
-          inboundJournal,
-          activeRuns,
-          agent,
-          processPool: pool,
-          runExecutor: executor,
-          controls,
-          pending,
-          chatModeCache,
-          callbackAuth,
-          callbackPolicyFingerprintForScope: (scope) => activePolicyFingerprints.get(scope),
-        });
-      }).catch((err) => log.fail('cardAction', err));
+      await trackSettle(
+        withTrace({ chatId: evt.chatId, msgId: evt.messageId }, () =>
+          handleCardAction({
+            channel,
+            evt,
+            sessions,
+            sessionCatalog,
+            workspaces,
+            thinkingHistory,
+            inboundJournal,
+            activeRuns,
+            agent,
+            processPool: pool,
+            runExecutor: executor,
+            controls,
+            pending,
+            chatModeCache,
+            callbackAuth,
+            callbackPolicyFingerprintForScope: (scope) => activePolicyFingerprints.get(scope),
+            shutdownSignal: shutdown.signal,
+          }),
+        ).catch((err) => log.fail('cardAction', err)),
+      );
     },
     comment: async (evt) => {
+      // Same producer-entry discipline as cardAction (评审八轮 P1).
       if (shutdown.signal.aborted) {
         log.info('comment', 'rejected-by-shutdown', { commentId: evt.commentId });
         return;
       }
-      await withTrace({ chatId: 'comment' }, async () => {
-        await handleCommentMention({
-          channel,
-          evt,
-          agent,
-          sessions,
-          sessionCatalog,
-          workspaces,
-          activeRuns,
-          executor,
-          controls,
-        }).catch((err) => log.fail('comment', err));
-      }).catch((err) => log.fail('comment', err));
+      await trackSettle(
+        withTrace({ chatId: 'comment' }, () =>
+          handleCommentMention({
+            channel,
+            evt,
+            agent,
+            sessions,
+            sessionCatalog,
+            workspaces,
+            activeRuns,
+            executor,
+            controls,
+            shutdownSignal: shutdown.signal,
+          }),
+        ).catch((err) => log.fail('comment', err)),
+      );
     },
     reconnecting: () => {
       consecutiveReconnects++;

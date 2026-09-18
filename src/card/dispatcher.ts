@@ -47,6 +47,9 @@ export interface CardDispatchDeps {
   callbackAuth?: CallbackAuth;
   callbackPolicyFingerprint?: string;
   callbackPolicyFingerprintForScope?: (scope: string) => string | undefined;
+  /** Graceful-shutdown signal (评审八轮 P1): checked again at the callback's
+   * persistence and dispatch boundaries, not just at the handler entry. */
+  shutdownSignal?: AbortSignal;
 }
 
 export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
@@ -71,6 +74,20 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // Done before the access check so we know the chat mode (p2p vs group)
   // and can skip the chat allowlist for DMs.
   const { scope, threadId, mode } = await resolveScope(deps);
+
+  // resolveScope is the callback's first await (chat-mode + topic thread
+  // lookups). A click that entered before shutdown but parked here must stop
+  // before any journal write, pending.push, or command side effect — the
+  // handler is lifecycle-tracked, so disconnect waits for this return
+  // rather than racing it (评审八轮 P1).
+  if (deps.shutdownSignal?.aborted) {
+    log.info('cardAction', 'dropped-by-shutdown', {
+      scope,
+      messageId: deps.evt.messageId,
+      operator: operatorId.slice(-6),
+    });
+    return;
+  }
 
   const accessDecision =
     mode === 'p2p'
@@ -206,16 +223,23 @@ async function handleInboundRecoveryAction(
   },
 ): Promise<void> {
   const journal = deps.inboundJournal;
-  const send = (markdown: string): void => {
-    void deps.channel.send(input.chatId, { markdown }).catch((err) => log.fail('inbound', err));
+  // 评审八轮 P2 (same class as the startup recovery notices): feedback sends
+  // are awaited so they finish inside the lifecycle-tracked callback — a
+  // `void send` could still be in flight after disconnect returns.
+  const send = async (markdown: string): Promise<void> => {
+    try {
+      await deps.channel.send(input.chatId, { markdown });
+    } catch (err) {
+      log.fail('inbound', err);
+    }
   };
   if (!journal || !input.messageId) {
-    send('恢复记录不可用（journal 未启用或缺少消息 id）。');
+    await send('恢复记录不可用（journal 未启用或缺少消息 id）。');
     return;
   }
   const record = journal.getRecord(input.scope, input.messageId);
   if (!record || (record.status !== 'uncertain' && record.status !== 'expired')) {
-    send('该恢复记录已处理过。');
+    await send('该恢复记录已处理过。');
     return;
   }
 
@@ -230,11 +254,11 @@ async function handleInboundRecoveryAction(
       owner: record.senderId.slice(-6),
       clicker: clicker.slice(-6),
     });
-    send('仅原任务所有者或管理员可操作该恢复卡。');
+    await send('仅原任务所有者或管理员可操作该恢复卡。');
     return;
   }
   if (Date.now() - record.acceptedAt > RECOVERY_ACTION_TTL_MS) {
-    send('该恢复卡已超过 24 小时操作时限，请直接重新发送任务。');
+    await send('该恢复卡已超过 24 小时操作时限，请直接重新发送任务。');
     return;
   }
 
@@ -249,14 +273,25 @@ async function handleInboundRecoveryAction(
       messageId: input.messageId,
       persisted: dismissed,
     });
-    send(dismissed ? '✓ 已忽略该恢复记录。' : '⚠️ 恢复记录暂时无法写入，稍后可重试忽略。');
+    await send(dismissed ? '✓ 已忽略该恢复记录。' : '⚠️ 恢复记录暂时无法写入，稍后可重试忽略。');
     return;
   }
 
   const dispatch = async (
     content: string,
     opts?: { resetSession?: boolean },
-  ): Promise<'dispatched' | 'settled' | 'retry'> => {
+  ): Promise<'dispatched' | 'settled' | 'retry' | 'skipped'> => {
+    // Persistence/dispatch boundary re-check (评审八轮 P1): a click that
+    // passed the earlier gate but resumed after shutdown must not journal a
+    // redo or arm a pending dispatch the draining instance will never run.
+    if (deps.shutdownSignal?.aborted) {
+      log.info('inbound', 'recovery-dispatch-skipped-by-shutdown', {
+        scope: input.scope,
+        messageId: input.messageId,
+        action: input.cmd,
+      });
+      return 'skipped';
+    }
     const newId = await journal.redo(input.scope, input.messageId, {
       contentOverride: content,
       senderId: clicker,
@@ -298,10 +333,14 @@ async function handleInboundRecoveryAction(
     return 'dispatched';
   };
 
-  const sendOutcome = (outcome: 'dispatched' | 'settled' | 'retry', success: string): void => {
-    if (outcome === 'retry') send('⚠️ 恢复记录暂时无法写入，请稍后重试。');
-    else if (outcome === 'settled') send('该恢复记录已处理过。');
-    else send(success);
+  const sendOutcome = async (
+    outcome: 'dispatched' | 'settled' | 'retry' | 'skipped',
+    success: string,
+  ): Promise<void> => {
+    if (outcome === 'skipped') return;
+    if (outcome === 'retry') await send('⚠️ 恢复记录暂时无法写入，请稍后重试。');
+    else if (outcome === 'settled') await send('该恢复记录已处理过。');
+    else await send(success);
   };
 
   if (input.cmd === 'inbound.continue') {
@@ -309,7 +348,7 @@ async function handleInboundRecoveryAction(
     // there is nothing to continue — degrade to a plain dispatch.
     const content = wasUncertain ? continuationPrompt(record.content) : record.content;
     const outcome = await dispatch(content);
-    sendOutcome(
+    await sendOutcome(
       outcome,
       wasUncertain
         ? '💬 已在原会话提交继续请求，agent 会先检查进度再接着做。'
@@ -328,16 +367,16 @@ async function handleInboundRecoveryAction(
     // enqueue and reset (a startup replay still carries the intent).
     const outcome = await dispatch(record.content, { resetSession: true });
     if (outcome !== 'dispatched') {
-      sendOutcome(outcome, '');
+      await sendOutcome(outcome, '');
       return;
     }
-    send('♻️ 已重新提交完整任务，执行前将重置会话，后续消息在新会话中处理。');
+    await send('♻️ 已重新提交完整任务，执行前将重置会话，后续消息在新会话中处理。');
     return;
   }
 
   // expired: nothing ever ran — plain dispatch into the current session.
   const outcome = await dispatch(record.content);
-  sendOutcome(outcome, '▶️ 已按原内容提交执行。');
+  await sendOutcome(outcome, '▶️ 已按原内容提交执行。');
 }
 
 async function resolveScope(

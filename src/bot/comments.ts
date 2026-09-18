@@ -37,6 +37,10 @@ export interface CommentDeps {
   activeRuns?: ActiveRuns;
   executor: RunExecutor;
   controls: Controls;
+  /** Graceful-shutdown signal (评审八轮 P1): the handler is lifecycle-tracked
+   * from its entry, and this gate stops a resumed-after-abort handler from
+   * spawning an agent run the draining instance will never finish. */
+  shutdownSignal?: AbortSignal;
 }
 
 // File types supported by drive.v1.fileComment.get; other types (slides,
@@ -255,6 +259,15 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         cwd: cwdRealpath,
       });
 
+      // Dispatch boundary re-check (评审八轮 P1): the handler sat through
+      // several network awaits above; if shutdown began meanwhile, stop here
+      // instead of spawning a run the draining instance will never complete.
+      if (deps.shutdownSignal?.aborted) {
+        log.info('comment', 'dispatch-skipped-by-shutdown', {
+          commentScopeId: runScopeId,
+        });
+        return;
+      }
       const execution = await deps.executor.submit({
         scopeId: runScopeId,
         policy,
