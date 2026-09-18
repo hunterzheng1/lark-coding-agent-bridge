@@ -153,6 +153,8 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/ws remove <name>` | 删除命名工作空间 |
 | `/resume` | 恢复同 agent、工作目录和权限模式兼容的历史会话。CodeBuddy 通过 catalog `sessionId` 续聊；暂不支持浏览 CodeBuddy 原生历史目录，因此候选列表可能为空 |
 | `/last [N]` | 查看上一条 run 的最后 N 行输出（默认 20） |
+| `/last full [页]` | 无损分页查看上一条 run 的完整输出 |
+| `/thinking [runId前缀] [页]` | 分页查看最近一次（或指定 runId）运行的思考记录 |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
 | `/account` | 通过卡片查看或更换应用凭据（`change`、`submit`、`cancel`） |
@@ -315,6 +317,8 @@ grep '"event":"enter"' ~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y
 **为什么卡片不展示每次工具调用的完整输入和输出**：从 v0.3.15 开始，无论工具调用数量多少，整次运行都只使用一个折叠工具容器。容器使用有界摘要，避免长任务超过飞书卡片限制；完整工具详情仍保存在结构化运行日志中，可在本机检查。
 
 **为什么最后一个工具结束后，卡片仍处于运行状态**：工具执行完成不等于 agent 运行结束。从 v0.3.17 开始，bridge 收到最后一个工具结果后，卡片底部改为「正在收尾」，并继续等待 agent 的终止事件。此时「终止」按钮仍然可用。如果卡片长时间停在「正在收尾」，检查 agent 的 Stop Hook 或本机 CLI 日志；bridge 不会在进程实际结束前提前显示成功。
+
+**bot 中途重启或崩溃后，任务会怎样？** 从 v0.3.18 开始，每条被接收的消息在进入内存合批队列前都会先落盘（`~/.lark-channel/profiles/<profile>/inbound/`）；优雅停机会等待在途批次、卡片回调和恢复通知全部落定后再 flush 状态退出。异常退出后的下一次启动：从未派发的任务按正常流程重放；执行结果未知的中断任务不会自动重跑，而是发出恢复卡，由你选择「💬 继续对话」「♻️ 重头重做」或「忽略」。带副作用的任务不会被静默重复执行；恢复卡仅原任务所有者或管理员可在 24 小时内操作。
 
 **Windows 任务已停止，但旧 bot 仍然回复**：bridge 子进程可能比 `wscript.exe` 包装器存活得更久。先运行 `lark-channel-bridge ps`，再用 `lark-channel-bridge kill <id|#>` 停止对应进程。确认旧进程已退出后，运行 `lark-channel-bridge start --profile <name>`。清理前不要启动第二个实例，否则可能发生 profile 或 app 锁冲突。
 

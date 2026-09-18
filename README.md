@@ -153,6 +153,8 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws remove <name>` | Delete a named workspace |
 | `/resume` | Resume compatible history for the same agent, working directory, and permission mode. CodeBuddy continues via catalog `sessionId`; browsing CodeBuddy's native history directory is not supported yet (candidate list may be empty). |
 | `/last [N]` | Show the last N lines of the previous run's output (default 20) |
+| `/last full [page]` | Page through the complete previous-run output (lossless, paginated) |
+| `/thinking [runId-prefix] [page]` | Show the stored thinking record of the latest (or identified) run, paginated |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
 | `/account` | View or change app credentials via a card (`change`, `submit`, `cancel`) |
@@ -315,6 +317,8 @@ Cloud-doc comments do not need a separate workspace binding or document allowlis
 **Why does the card not show every tool input and output?** Since v0.3.15, every run uses one collapsed tool container regardless of tool count. The container keeps a bounded summary so long runs cannot exceed Feishu card limits; complete tool details remain in the structured run log for local inspection.
 
 **Why does the card remain active after the last tool finishes?** A completed tool is not the same as a completed agent run. From v0.3.17, after the final tool result the footer changes to **Wrapping up** (`正在收尾`) while the bridge waits for the agent's terminal event. The Stop button remains available during this state. If the card stays there, inspect the agent's Stop Hook or local CLI logs; the bridge does not report success before the process actually finishes.
+
+**What happens to tasks when the bot restarts or crashes mid-run?** From v0.3.18, every accepted message is journaled to disk (`~/.lark-channel/profiles/<profile>/inbound/`) before it enters the in-memory batch queue, and a graceful shutdown waits for in-flight batches, card callbacks, and recovery notices to settle before flushing state and returning. After an abnormal exit, the next startup replays tasks that were never dispatched, and for tasks whose run was interrupted with an unknown outcome it sends a recovery card instead of rerunning automatically — **Continue in session** (`💬 继续对话`), **Redo from scratch** (`♻️ 重头重做`), or **Dismiss** (`忽略`). Tasks with side effects are never silently repeated; only the original sender or an admin can act on the card within 24 hours.
 
 **A Windows task is stopped, but the old bot still replies.** A bridge child process can outlive the `wscript.exe` wrapper. Run `lark-channel-bridge ps`, stop the matching process with `lark-channel-bridge kill <id|#>`, confirm the old process is gone, and then run `lark-channel-bridge start --profile <name>`. Starting another copy before cleanup can cause profile or app lock conflicts.
 
