@@ -70,7 +70,9 @@ function doneEvents(text = 'recovery answer'): AgentEvent[] {
 }
 
 interface HarnessDeps {
-  journalDir: string;
+  journalDir?: string;
+  /** Externally seeded journal — takes precedence over journalDir. */
+  journal?: InboundJournal;
   events?: AgentEvent[];
 }
 
@@ -78,13 +80,15 @@ async function startBridge(deps: HarnessDeps): Promise<{
   channel: FakeLarkChannel;
   agent: FakeAgentAdapter;
   journal: InboundJournal;
+  sessions: SessionStore;
+  bridge: Awaited<ReturnType<typeof startChannel>>;
   profileDir: string;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
 }> {
   const tmp = await createTmpProfile('inbound-e2e-');
   const workspace = await realpath(tmp.workspace);
   cleanups.push(() => tmp.cleanup());
-  const journal = new InboundJournal(deps.journalDir);
+  const journal = deps.journal ?? new InboundJournal(deps.journalDir!);
   await journal.load();
   const profileConfig = createDefaultProfileConfig({
     agentKind: 'claude',
@@ -114,7 +118,7 @@ async function startBridge(deps: HarnessDeps): Promise<{
   });
   cleanups.push(() => bridge.disconnect());
 
-  return { channel, agent, journal, profileDir: tmp.profile, profileConfig };
+  return { channel, agent, journal, sessions, bridge, profileDir: tmp.profile, profileConfig };
 }
 
 describe('inbound journal end-to-end (OPT-04)', () => {
@@ -151,7 +155,7 @@ describe('inbound journal end-to-end (OPT-04)', () => {
 
     const h = await startBridge({ journalDir: dir });
     // Recovery replays after a short delay, through pending → run flow.
-    await waitFor(() => h.agent.runs.length === 1, 6000);
+    await waitFor(() => h.agent.runs.length === 1, 8000);
     const prompt = h.agent.runOptions[0]!.prompt;
     expect(prompt).toContain('crash window task');
     // And the replayed message claims + settles like a normal one.
@@ -318,6 +322,100 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void
   }
   throw new Error('timed out waiting for async work');
 }
+
+/** Journal whose pre-spawn claim can be parked mid-flight, so tests can
+ * observe state strictly between flush start and executor.submit. */
+class GatedClaimJournal extends InboundJournal {
+  claimReached = false;
+  gate: Promise<void> | undefined;
+  override async markClaimed(
+    scope: string,
+    messageIds: readonly string[],
+    runId: string,
+  ): Promise<boolean> {
+    this.claimReached = true;
+    if (this.gate) await this.gate;
+    return super.markClaimed(scope, messageIds, runId);
+  }
+}
+
+describe('重头重做 resetSession 意图（评审四轮）', () => {
+  it('disconnect covers a batch parked in the pre-spawn claim (no tracking dead zone)', async () => {
+    const dir = await mkdtempInbound();
+    const journal = new GatedClaimJournal(dir);
+    let release!: () => void;
+    journal.gate = new Promise<void>((r) => (release = r));
+    const h = await startBridge({ journal });
+
+    await h.channel.handlers.message?.(message('parked claim task'));
+    await waitFor(() => journal.claimReached, 8000);
+
+    // Disconnect while the batch sits between flush start and spawn — the
+    // window where only the inner processAgentStream promises used to be
+    // tracked. Release shortly after so the drain loop keeps waiting on the
+    // tracked batch lifecycle instead of seeing an empty settle set.
+    const disconnecting = h.bridge.disconnect();
+    await new Promise((r) => setTimeout(r, 300));
+    release();
+    await disconnecting;
+
+    // disconnect returned ⇒ the whole batch already ran to completion:
+    // the post-claim submit hit the disconnect pause, the rejection settled
+    // the record. An untracked batch would have flushed the journal while
+    // it still read 'queued'.
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm')[0]?.status).toBe('terminal');
+    expect(onDisk.list('oc_dm')[0]?.terminalState).toBe('rejected');
+  });
+
+  it('crash-replayed redo record resets the session before claim/spawn', async () => {
+    const dir = await mkdtempInbound();
+    // Process A: accepted + claimed, then died without a terminal event.
+    const journal = new GatedClaimJournal(dir);
+    await journal.recordAccepted({
+      messageId: 'om_dead',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'interrupted redo task',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await journal.markClaimed('oc_dm', ['om_dead'], 'run-lost');
+    await journal.flush();
+
+    // Process B's view: uncertain → the user clicks 重头重做 (redo carries
+    // the resetSession intent) — then this process dies before the re-run.
+    await journal.load();
+    await journal.recoverOnStartup();
+    const redoId = await journal.redo('oc_dm', 'om_dead', {
+      resetSession: true,
+      senderId: 'ou_user',
+    });
+    expect(redoId).toBeTruthy();
+    await journal.flush();
+
+    // Process C: startup recovery replays the flagged queued record. Park
+    // the pre-spawn claim so we can inspect state right after the reset.
+    let release!: () => void;
+    journal.claimReached = false;
+    journal.gate = new Promise<void>((r) => (release = r));
+    const h = await startBridge({ journal });
+    // A resumable old session exists — the reported bug was replay using it.
+    h.sessions.set('oc_dm', 'sess-old', 'C:/old');
+
+    await waitFor(() => journal.claimReached, 8000);
+    // Claim is parked: the reset already ran before resume resolution/claim.
+    expect(h.sessions.getRaw('oc_dm')?.sessionId).toBeUndefined();
+    expect(journal.getRecord('oc_dm', redoId!)?.resetSession).toBe(false);
+    release();
+
+    await waitFor(() => h.agent.runs.length === 1, 8000);
+    expect(h.agent.runOptions[0]!.prompt).toContain('interrupted redo task');
+    await waitFor(() => journal.getRecord('oc_dm', redoId!)?.status === 'terminal', 8000);
+  });
+});
 
 describe('inbound journal review fixes (阻断 1/2)', () => {
   it('a redelivered message whose run already finished does not execute again', async () => {

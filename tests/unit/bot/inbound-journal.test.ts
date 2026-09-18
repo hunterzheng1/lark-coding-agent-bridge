@@ -117,6 +117,21 @@ describe('InboundJournal', () => {
     expect(await j.recordAccepted(accepted())).toBe('failed');
   });
 
+  it('a failed write rolls back only its own reservation, never a replacement', async () => {
+    const dir = await freshDir();
+    const blocker = join(dir, 'occupied');
+    await writeFile(blocker, 'x', 'utf8');
+    const j = new InboundJournal(blocker);
+    const inflight = j.recordAccepted(accepted({ messageId: 'om_k' }));
+    // While mkdir is in flight the old reservation was cleared (/new) and the
+    // SAME id re-accepted as a newer record — the failed write's rollback
+    // must not evict it.
+    const records = (j as unknown as { records: Map<string, InboundRecord> }).records;
+    records.set('oc_chat1\u0000om_k', { ...accepted({ messageId: 'om_k' }), status: 'queued' });
+    expect(await inflight).toBe('failed');
+    expect(j.getRecord('oc_chat1', 'om_k')).toBeDefined();
+  });
+
   it('clearQueued removes only queued records for the scope (/new semantics)', async () => {
     const dir = await freshDir();
     const j = new InboundJournal(dir);
@@ -178,6 +193,20 @@ describe('InboundJournal recovery actions (recovery card)', () => {
     expect(j.getRecord('oc_chat1', 'om_old')?.status).toBe('expired');
     expect(await j.redo('oc_chat1', 'om_old')).toBeTruthy();
     expect(await j.redo('oc_chat1', 'om_nope')).toBeUndefined();
+  });
+
+  it('redo can carry a resetSession intent on the fresh record only', async () => {
+    const dir = await freshDir();
+    const j = await seeded(dir);
+    const newId = await j.redo('oc_chat1', 'om_u', { resetSession: true });
+    expect(j.getRecord('oc_chat1', newId!)?.resetSession).toBe(true);
+    expect(j.getRecord('oc_chat1', 'om_u')?.resetSession).toBeUndefined();
+    // Without the opt nothing is flagged (继续对话 / expired plain redo).
+    await j.recordAccepted(accepted({ messageId: 'om_u2' }));
+    await j.markClaimed('oc_chat1', ['om_u2'], 'run-2');
+    await j.recoverOnStartup();
+    const plainId = await j.redo('oc_chat1', 'om_u2');
+    expect(j.getRecord('oc_chat1', plainId!)?.resetSession).toBeUndefined();
   });
 });
 

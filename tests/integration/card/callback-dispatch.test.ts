@@ -218,9 +218,13 @@ describe('recovery card 继续对话 vs 重头重做 split', () => {
     expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-live');
     const old = h.journal.getRecord('oc_group', 'om_unc');
     expect(old?.terminalState).toBe('redone');
+    // P2 regression: the success wording must follow the ORIGINAL status
+    // (journal.redo mutates record.status in place before it is read).
+    expect(JSON.stringify(h.channel.sent)).toContain('已在原会话');
+    expect(JSON.stringify(h.channel.sent)).not.toContain('未曾执行');
   });
 
-  it('重头重做 resets the session and dispatches the original text', async () => {
+  it('重头重做 journals a resetSession intent instead of resetting in the click handler', async () => {
     const h = await createHarness();
     await seedWithSession(h);
 
@@ -229,8 +233,12 @@ describe('recovery card 继续对话 vs 重头重做 split', () => {
     const queued = h.pending.cancel('oc_group');
     expect(queued).toHaveLength(1);
     expect(queued[0]?.content).toBe('original task text');
-    // Session was reset — the re-run cannot resume the interrupted context.
-    expect(h.sessions.getRaw('oc_group')?.sessionId).toBeUndefined();
+    // The reset rides on the journaled re-run record and executes in
+    // runAgentBatch BEFORE resume resolution and claim — the dispatcher
+    // side must not touch the session (that raced the debounce window).
+    const rec = h.journal.getRecord('oc_group', queued[0]!.messageId);
+    expect(rec?.resetSession).toBe(true);
+    expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-live');
   });
 
   it('expired record: redo dispatches plainly without touching the session', async () => {
@@ -252,6 +260,7 @@ describe('recovery card 继续对话 vs 重头重做 split', () => {
     const queued = h.pending.cancel('oc_group');
     expect(queued).toHaveLength(1);
     expect(queued[0]?.content).toBe('never dispatched task');
+    expect(h.journal.getRecord('oc_group', queued[0]!.messageId)?.resetSession).toBeUndefined();
     expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-keep');
   });
 

@@ -38,6 +38,10 @@ export interface InboundRecord {
   settledAt?: number;
   /** Set when the run reached a known terminal state. */
   terminalState?: string;
+  /** 重头重做 intent: the scope session must be reset (archive + clear, same
+   * as /new) before this record's run resolves resume state and claims.
+   * Cleared by runAgentBatch once executed. */
+  resetSession?: boolean;
 }
 
 export interface InboundJournalLimits {
@@ -126,11 +130,12 @@ export class InboundJournal {
     const k = key(input.scope, input.messageId);
     if (this.records.has(k)) return 'duplicate'; // duplicate delivery — idempotent
     // Synchronous reservation — no await before this point.
-    this.records.set(k, { ...input, status: 'queued' });
+    const reservation: InboundRecord = { ...input, status: 'queued' };
+    this.records.set(k, reservation);
     try {
       await mkdir(this.dir, { recursive: true });
     } catch (err) {
-      this.records.delete(k); // roll back the reservation
+      rollbackReservation(this.records, k, reservation); // roll back the reservation
       log.fail('inbound', err, { step: 'mkdir', scope: input.scope });
       return 'failed';
     }
@@ -138,7 +143,7 @@ export class InboundJournal {
     if (!persisted) {
       // Roll back the reservation: a failed write must not make later
       // deliveries of the same id look like duplicates forever.
-      this.records.delete(k);
+      rollbackReservation(this.records, k, reservation);
       return 'failed';
     }
     return 'recorded';
@@ -259,7 +264,7 @@ export class InboundJournal {
   async redo(
     scope: string,
     messageId: string,
-    opts?: { contentOverride?: string; senderId?: string },
+    opts?: { contentOverride?: string; senderId?: string; resetSession?: boolean },
   ): Promise<string | undefined> {
     const record = this.records.get(key(scope, messageId));
     if (!record) return undefined;
@@ -280,6 +285,7 @@ export class InboundJournal {
       status: 'queued',
       ...(record.threadId ? { threadId: record.threadId } : {}),
       ...(record.chatType ? { chatType: record.chatType } : {}),
+      ...(opts?.resetSession ? { resetSession: true } : {}),
     });
     const persisted = await this.persistScope(scope);
     if (!persisted) {
@@ -393,6 +399,18 @@ export class InboundJournal {
 
 function key(scope: string, messageId: string): string {
   return `${scope}\u0000${messageId}`;
+}
+
+/** Roll back a failed recordAccepted reservation — but only while the map
+ * still holds THIS object. If the write was in flight when the record was
+ * cleared (/new) and re-accepted under the same key, the newer record must
+ * survive the old call's failure. */
+function rollbackReservation(
+  records: Map<string, InboundRecord>,
+  k: string,
+  reservation: InboundRecord,
+): void {
+  if (records.get(k) === reservation) records.delete(k);
 }
 
 /**

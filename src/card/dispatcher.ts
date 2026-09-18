@@ -1,8 +1,7 @@
 import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
-import type { ChatMode, ChatModeCache } from '../bot/chat-mode-cache';
-import type { AccessDecision } from '../policy/access';
+import type { ChatModeCache } from '../bot/chat-mode-cache';
 import type { InboundJournal } from '../bot/inbound-journal';
 import { recoveryMessageFrom } from '../bot/inbound-journal';
 import type { PendingQueue } from '../bot/pending-queue';
@@ -105,9 +104,6 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
         scope,
         chatId,
         threadId,
-        mode,
-        msg: makeFakeMsg(deps.evt, threadId),
-        access: accessDecision,
         cmd,
         messageId,
       });
@@ -186,9 +182,10 @@ function continuationPrompt(content: string): string {
  * Recovery-card button actions (OPT-04 分片 4):
  * - `inbound.continue`（继续对话）: keep the session, dispatch a continuation
  *   prompt so the agent inspects progress and picks up where things stand.
- * - `inbound.redo`: uncertain → reset the scope session (archive the catalog
- *   entry + clear the session store, same as /new) and re-dispatch the
- *   original task from scratch; expired (never dispatched) → just dispatch
+ * - `inbound.redo`: uncertain → journal the re-run with a resetSession intent
+ *   (runAgentBatch archives the catalog entry + clears the session store,
+ *   same as /new, before it resolves resume state and claims) and re-dispatch
+ *   the original task from scratch; expired (never dispatched) → just dispatch
  *   the original content into the current session, no reset.
  * - `inbound.dismiss`: settle without running.
  *
@@ -204,9 +201,6 @@ async function handleInboundRecoveryAction(
     scope: string;
     chatId: string;
     threadId: string | undefined;
-    mode: ChatMode;
-    msg: NormalizedMessage;
-    access: AccessDecision;
     cmd: string;
     messageId: string;
   },
@@ -225,7 +219,7 @@ async function handleInboundRecoveryAction(
     return;
   }
 
-  const clicker = input.msg.senderId;
+  const clicker = deps.evt.operator.openId;
   const isOwnerOrAdmin =
     record.senderId === clicker ||
     canRunAdminCommand(deps.controls.profileConfig, deps.controls, clicker).ok;
@@ -244,6 +238,10 @@ async function handleInboundRecoveryAction(
     return;
   }
 
+  // journal.redo mutates record.status in place (→ terminal/redone), so the
+  // original status must be captured before any dispatch call.
+  const wasUncertain = record.status === 'uncertain';
+
   if (input.cmd === 'inbound.dismiss') {
     const dismissed = await journal.markDismissed(input.scope, input.messageId);
     log.info('inbound', 'recovery-dismiss', {
@@ -257,10 +255,12 @@ async function handleInboundRecoveryAction(
 
   const dispatch = async (
     content: string,
+    opts?: { resetSession?: boolean },
   ): Promise<'dispatched' | 'settled' | 'retry'> => {
     const newId = await journal.redo(input.scope, input.messageId, {
       contentOverride: content,
       senderId: clicker,
+      ...(opts?.resetSession ? { resetSession: true } : {}),
     });
     if (!newId) {
       // Distinguish "already settled" from "persistence failed, record is
@@ -307,12 +307,11 @@ async function handleInboundRecoveryAction(
   if (input.cmd === 'inbound.continue') {
     // 继续对话: keep the session. For an expired record (never dispatched)
     // there is nothing to continue — degrade to a plain dispatch.
-    const content =
-      record.status === 'uncertain' ? continuationPrompt(record.content) : record.content;
+    const content = wasUncertain ? continuationPrompt(record.content) : record.content;
     const outcome = await dispatch(content);
     sendOutcome(
       outcome,
-      record.status === 'uncertain'
+      wasUncertain
         ? '💬 已在原会话提交继续请求，agent 会先检查进度再接着做。'
         : '▶️ 该记录未曾执行，已直接提交执行。',
     );
@@ -320,28 +319,19 @@ async function handleInboundRecoveryAction(
   }
 
   // inbound.redo
-  if (record.status === 'uncertain') {
-    // Full redo: persist + enqueue the re-run FIRST — only after the task is
-    // durably queued do we reset the scope session (catalog entry + session
-    // store, same as /new). A failed write must not destroy the old session.
-    const outcome = await dispatch(record.content);
+  if (wasUncertain) {
+    // Full redo: the session reset (catalog archive + clear, same as /new)
+    // is NOT done here. The resetSession intent rides on the journaled
+    // re-run record, and runAgentBatch executes it before it resolves
+    // resume state and claims — closing both the 600ms debounce race (the
+    // reset used to run after pending.push) and the crash window between
+    // enqueue and reset (a startup replay still carries the intent).
+    const outcome = await dispatch(record.content, { resetSession: true });
     if (outcome !== 'dispatched') {
       sendOutcome(outcome, '');
       return;
     }
-    const identity = await commandSessionCatalogIdentity({
-      msg: input.msg,
-      scope: input.scope,
-      mode: input.mode,
-      workspaces: deps.workspaces,
-      controls: deps.controls,
-      access: input.access,
-    });
-    if (identity) {
-      deps.sessionCatalog?.archiveActive({ ...identity, now: Date.now() });
-    }
-    deps.sessions.clear(input.scope);
-    send('♻️ 已重置会话并重新提交完整任务，后续消息将在新会话中处理。');
+    send('♻️ 已重新提交完整任务，执行前将重置会话，后续消息在新会话中处理。');
     return;
   }
 

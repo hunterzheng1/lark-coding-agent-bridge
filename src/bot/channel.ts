@@ -285,35 +285,42 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     const firstMsg = batch[0];
     if (!firstMsg) return;
     pending.block(scope);
-    void withTrace({ chatId: firstMsg.chatId }, async () => {
-      log.info('flush', 'start', { scope, batchSize: batch.length });
-      try {
-        const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
-        const mode: ChatMode = firstMsg.threadId ? 'topic' : resolvedMode;
-        await runAgentBatch({
-          channel,
-          executor,
-          sessions,
-          sessionCatalog,
-          workspaces,
-          thinkingHistory,
-          inboundJournal,
-          media,
-          batch,
-          controls,
-          callbackAuth,
-          activePolicyFingerprints,
-          scope,
-          mode,
-          trackSettle,
-        });
-      } catch (err) {
-        log.fail('flush', err);
-      } finally {
-        pending.unblock(scope);
-        log.info('flush', 'end');
-      }
-    });
+    // The WHOLE batch lifecycle is tracked from creation — mode resolve,
+    // media/quote prep, policy, spawn, stream, terminal hooks. Tracking only
+    // the inner processAgentStream promises leaves a dead window (disconnect
+    // during mode resolve / policy / spawn sees an empty settle set and
+    // flushes too early).
+    void trackSettle(
+      withTrace({ chatId: firstMsg.chatId }, async () => {
+        log.info('flush', 'start', { scope, batchSize: batch.length });
+        try {
+          const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
+          const mode: ChatMode = firstMsg.threadId ? 'topic' : resolvedMode;
+          await runAgentBatch({
+            channel,
+            executor,
+            sessions,
+            sessionCatalog,
+            workspaces,
+            thinkingHistory,
+            inboundJournal,
+            media,
+            batch,
+            controls,
+            callbackAuth,
+            activePolicyFingerprints,
+            scope,
+            mode,
+            trackSettle,
+          });
+        } catch (err) {
+          log.fail('flush', err);
+        } finally {
+          pending.unblock(scope);
+          log.info('flush', 'end');
+        }
+      }),
+    );
   });
 
   // OPT-04 startup recovery: journal leftovers from a previous process.
@@ -883,6 +890,39 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     ...(threadId ? { threadId } : {}),
   };
   const capability = capabilityForAgentKind(controls.profileConfig.agentKind, controls.profileConfig);
+  // OPT-04 重头重做: a redo record may carry a resetSession intent. Execute it
+  // here — before startRunFlow resolves resume state and before the pre-spawn
+  // claim — so both the live-flush path and a crash replay reset the scope
+  // session (catalog archive + clear, same as /new) deterministically. The
+  // flag is cleared in memory and persisted by the claim right after; a crash
+  // in between merely re-runs the (idempotent) reset on replay.
+  if (inboundJournal) {
+    const flagged = batch.filter(
+      (m) => inboundJournal.getRecord(scope, m.messageId)?.resetSession,
+    );
+    if (flagged.length > 0) {
+      const identity = await commandSessionCatalogIdentity({
+        msg: firstMsg,
+        scope,
+        mode,
+        workspaces,
+        controls,
+        access: accessDecision,
+      });
+      if (identity) {
+        sessionCatalog?.archiveActive({ ...identity, now: Date.now() });
+      }
+      sessions.clear(scope);
+      for (const m of flagged) {
+        inboundJournal.getRecord(scope, m.messageId)!.resetSession = false;
+      }
+      log.info('inbound', 'recovery-reset-session', {
+        scope,
+        messageIds: flagged.map((m) => m.messageId),
+        archived: Boolean(identity),
+      });
+    }
+  }
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
