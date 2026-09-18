@@ -1,6 +1,6 @@
 # OPT-04：入站持久化、去重与恢复
 
-状态：分片 1–3 已实施（commit `1b95117`：故障窗口确认、持久 journal、认领与重启分类），分片 4 仅交付 markdown 恢复通知（未做结构化恢复卡）。本地验证通过、现场未验证。优先级 P1。实施记录见文末。
+状态：分片 1–3 已实施（commit `1b95117`），分片 4 已实施（commit `953ca1f`：结构化恢复卡 + 重做/忽略动作）。本地验证通过、现场未验证。优先级 P1。实施记录见文末。
 
 ## 问题
 
@@ -61,7 +61,7 @@
 
 ### 剩余事项
 
-- 分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡（无”继续会话/重做任务”按钮；恢复操作需用户手动重发或 /doctor）。
+- ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`）：`recoveryCard` 带「🔁 重做任务」「忽略」按钮；`inbound.redo` 将旧 uncertain/expired 记录落定为 redone 并以新 messageId 经正常 pending → 派发（重新过权限校验）→ claim → terminal 生命周期执行；`inbound.dismiss` 落定不执行；二次点击幂等。按钮为未签名 cmd 按钮（同 help 卡路径），聊天/用户准入沿用 dispatcher 既有检查，未改回调鉴权边界。
 - 真实进程 kill 级故障注入未做（测试以进程内模拟替代）；`delivery_pending` 未作为独立状态（终态即落定，最终卡片投递失败不影响 journal 状态）。
 - 云文档评论入口（comment scope）未接 journal（该入口不经过 im intake 路径）。
 - 优雅停机时 `pending.cancelAll` 丢弃的消息依赖下次启动的重放兜底；若用户在停机期间已在别处重做同一任务，重启重放会执行一次重复任务（去重仅按 messageId，无法识别语义重复）。
