@@ -24,6 +24,7 @@ import { SnapshotScheduler } from '../card/snapshot-scheduler';
 import {
   buildTerminalNotice,
   finalizeIfRunning,
+  formatModelNoticeSegment,
   finalReplyText,
   initialState,
   markIdleTimeout,
@@ -317,7 +318,22 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             trackSettle,
           );
           const mode: ChatMode = firstMsg.threadId ? 'topic' : resolvedMode;
-          await runAgentBatch({
+          // OPT-07 Slice C: split the batch by each message's frozen model
+          // snapshot so different target models never merge into one prompt
+          // (rule 6). Groups run SEQUENTIALLY (ActiveRuns allows one in-flight
+          // run per scope); a later /model change only affects messages
+          // accepted after it, and already-received/queued messages keep their
+          // snapshot. A shutdown between groups leaves the not-yet-run records
+          // `queued`, so the next startup replays them (rule 7).
+          const fallbackModel = inboundJournal
+            ? undefined
+            : sessions.getModelPreference(scope, agent.id)?.model;
+          const snapshotOf = (m: NormalizedMessage): string | undefined =>
+            inboundJournal
+              ? inboundJournal.getRecord(scope, m.messageId)?.model
+              : fallbackModel;
+          const groups = groupBatchByModelSnapshot(batch, snapshotOf);
+          const batchDeps = {
             channel,
             executor,
             sessions,
@@ -326,7 +342,6 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             thinkingHistory,
             inboundJournal,
             media,
-            batch,
             controls,
             callbackAuth,
             activePolicyFingerprints,
@@ -334,7 +349,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             mode,
             trackSettle,
             shutdownSignal: shutdown.signal,
-          });
+          };
+          for (const group of groups) {
+            if (shutdown.signal.aborted) throw new BridgeShutdownCancelled('between-groups');
+            await runAgentBatch({ ...batchDeps, batch: group.messages, model: group.model });
+          }
         } catch (err) {
           if (err instanceof BridgeShutdownCancelled) {
             // Expected graceful-shutdown cancellation, not a failure —
@@ -911,7 +930,6 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     }),
     runExecutor: executor,
     processPool: pool,
-    hasPendingForScope: (pendingScope) => pending.has(pendingScope),
     controls,
   });
   if (handled) {
@@ -945,6 +963,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
         senderId: msg.senderId,
         content: msg.content,
         acceptedAt: msg.createTime || Date.now(),
+        // OPT-07 Slice C: freeze the target model at acceptance so a later
+        // /model change cannot rewrite this message; dispatch groups by it.
+        model: sessions.getModelPreference(scope, agent.id)?.model,
         ...(msg.threadId ? { threadId: msg.threadId } : {}),
         ...(msg.chatType === 'p2p' ? { chatType: 'p2p' as const } : { chatType: 'group' as const }),
       })
@@ -1005,10 +1026,39 @@ interface RunBatchDeps {
   activePolicyFingerprints: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  /** OPT-07 Slice C: the model snapshot for THIS group (all its messages share
+   * it). `undefined` = no override (follow CLI). Resolved by the flush handler
+   * from each message's journaled snapshot, NOT the live preference. */
+  model?: string;
   /** Registers in-flight terminal callbacks so shutdown can await them. */
   trackSettle: (p: Promise<unknown>) => Promise<unknown>;
   /** Aborted at graceful disconnect; cancels pre-spawn network awaits. */
   shutdownSignal: AbortSignal;
+}
+
+interface ModelGroup {
+  model?: string;
+  messages: NormalizedMessage[];
+}
+
+/**
+ * OPT-07 Slice C: partition a flush into maximal runs of consecutive messages
+ * that share the same model snapshot. Order is preserved (a message is never
+ * reordered past a differently-targeted neighbour), so two messages that a
+ * /model change separated never collapse into one prompt. Exported for tests.
+ */
+export function groupBatchByModelSnapshot(
+  batch: NormalizedMessage[],
+  snapshotOf: (msg: NormalizedMessage) => string | undefined,
+): ModelGroup[] {
+  const groups: ModelGroup[] = [];
+  for (const msg of batch) {
+    const model = snapshotOf(msg);
+    const last = groups[groups.length - 1];
+    if (last && last.model === model) last.messages.push(msg);
+    else groups.push({ model, messages: [msg] });
+  }
+  return groups;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -1027,6 +1077,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints,
     scope,
     mode,
+    model,
     trackSettle,
     shutdownSignal,
   } = deps;
@@ -1109,11 +1160,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     ...(threadId ? { threadId } : {}),
   };
   const capability = capabilityForAgentKind(controls.profileConfig.agentKind, controls.profileConfig);
-  // OPT-07: resolve the persisted model override for this scope + backend at
-  // dispatch time. Modifications are rejected while this scope is busy, so
-  // reading here reflects the value intended for this batch (undefined = the
-  // CLI resolves its own model).
-  const scopeModel = sessions.getModelPreference(scope, capability.agentId)?.model;
   // OPT-04 重头重做: a redo record may carry a resetSession intent. Execute it
   // here — before startRunFlow resolves resume state and before the pre-spawn
   // claim — so both the live-flush path and a crash replay reset the scope
@@ -1201,7 +1247,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     workspaces,
     executor,
     now: Date.now(),
-    model: scopeModel,
+    model,
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,
@@ -1299,7 +1345,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         (b) => b.kind === 'tool' && b.tool.status === 'error',
       ).length;
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
-      const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated, failedTools });
+      // OPT-07 Slice C: report the model truthfully (reported value as-is;
+      // request-without-confirmation says so; nothing requested → silent).
+      const modelSegment = formatModelNoticeSegment({
+        reportedModel: state.reportedModel,
+        requestedModel: model,
+      });
+      const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated, failedTools }) + modelSegment;
       // Persist the run's thinking before advertising the /thinking entry —
       // a failed save must not produce a dead hint (OPT-01B). Tracked so a
       // graceful shutdown waits for the journal/thinking writes (OPT-04).
@@ -1851,6 +1903,10 @@ export async function processAgentStream(
 
       if (evt.type === 'system') {
         recordSession(evt);
+        // OPT-07 Slice C: keep the upstream-reported model (only when it
+        // actually reports one) so the completion notice can show the real
+        // model, distinct from what we requested. Never a guess.
+        if (evt.model) state = { ...state, reportedModel: evt.model };
         continue;
       }
       if (evt.type === 'usage') {

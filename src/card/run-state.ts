@@ -27,9 +27,14 @@ export interface RunState {
   /** Set when terminal === 'idle_timeout' — how long claude was idle before
    * the watchdog gave up (so the message can say "N 分钟无响应"). */
   idleTimeoutMinutes?: number;
-  /** Set by `windowState` when any text was dropped, so the caller can resend
+  /** Set when any text was dropped by `windowState`, so the caller can resend
    * the full text as a standalone message (C2 fallback). */
   truncated?: boolean;
+  /** OPT-07 Slice C: the model the upstream actually reported running (from a
+   * `system` event's `model`). Only present when the backend explicitly
+   * reports it — absence means "未报告", never a guess. Distinct from the
+   * requested override, so a request/actual mismatch is shown truthfully. */
+  reportedModel?: string;
 }
 
 export const initialState: RunState = {
@@ -296,6 +301,22 @@ export function buildCompletionNotice(opts: {
   const failedPart =
     opts.failedTools && opts.failedTools > 0 ? ` · ${opts.failedTools} 个工具失败` : '';
   return `✅ 完成 · 耗时 ${opts.mins}m · ${opts.toolCount} 工具${failedPart}${truncPart} · /doctor 查详情`;
+}
+
+/**
+ * OPT-07 Slice C: an honest one-line model segment for the completion notice.
+ * Shows the upstream-REPORTED model when the backend reported one; otherwise,
+ * only if a specific override was requested, says the actual model was not
+ * confirmed. When nothing was requested there is nothing to claim → empty. A
+ * request/actual mismatch is surfaced as the reported value, never reconciled.
+ */
+export function formatModelNoticeSegment(opts: {
+  reportedModel?: string;
+  requestedModel?: string;
+}): string {
+  if (opts.reportedModel) return ` · 本次模型：${opts.reportedModel}`;
+  if (opts.requestedModel) return ` · 请求模型：${opts.requestedModel}（未收到实际模型确认）`;
+  return '';
 }
 
 /**

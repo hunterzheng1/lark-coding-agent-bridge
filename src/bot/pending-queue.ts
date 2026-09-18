@@ -54,12 +54,6 @@ export class PendingQueue {
     return entry.messages;
   }
 
-  /** True when this scope has messages sitting in the queue (not yet
-   * flushed). Used by /model to reject changes while a scope is busy. */
-  has(scope: string): boolean {
-    return (this.map.get(scope)?.messages.length ?? 0) > 0;
-  }
-
   cancelAll(): void {
     for (const entry of this.map.values()) {
       if (entry.timer) clearTimeout(entry.timer);

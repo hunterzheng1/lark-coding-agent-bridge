@@ -831,3 +831,67 @@ describe('inbound journal review fixes (阻断 1/2)', () => {
     expect(h.agent.runs).toHaveLength(0);
   });
 });
+
+describe('OPT-07 Slice C：模型快照与合批', () => {
+  it('splits one flush into sequential runs by per-message snapshot (busy switch)', async () => {
+    const dir = await mkdtempInbound();
+    const h = await startBridge({ journalDir: dir });
+    await h.sessions.setModelPreference('oc_dm', 'claude', 'modelA');
+    await h.channel.handlers.message?.(message('alpha task'));
+    // Slice C: switching while the first message is still queued is allowed,
+    // but must NOT rewrite alpha's frozen snapshot — only beta adopts modelB.
+    await h.sessions.setModelPreference('oc_dm', 'claude', 'modelB');
+    await h.channel.handlers.message?.(message('beta task'));
+
+    await waitFor(() => h.agent.runs.length === 2, 8000);
+    expect(h.agent.runOptions[0]?.model).toBe('modelA');
+    expect(h.agent.runOptions[1]?.model).toBe('modelB');
+    expect(h.agent.runOptions[0]?.prompt).toContain('alpha task');
+    expect(h.agent.runOptions[1]?.prompt).toContain('beta task');
+  }, 20_000);
+
+  it('replays a crash-queued record with its ORIGINAL snapshot, not current pref', async () => {
+    const dir = await mkdtempInbound();
+    const seeded = new InboundJournal(dir);
+    await seeded.recordAccepted({
+      messageId: 'om_snap',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'snapshotted task',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+      model: 'frozen-model',
+    });
+    await seeded.flush();
+
+    const h = await startBridge({ journalDir: dir });
+    // Current preference deliberately differs from the frozen snapshot.
+    await h.sessions.setModelPreference('oc_dm', 'claude', 'current-model');
+    await waitFor(() => h.agent.runs.length === 1, 8000);
+    expect(h.agent.runOptions[0]?.model).toBe('frozen-model');
+    expect(h.agent.runOptions[0]?.prompt).toContain('snapshotted task');
+  }, 20_000);
+
+  it('a record with no snapshot field (pre-C log) runs with no override', async () => {
+    const dir = await mkdtempInbound();
+    const seeded = new InboundJournal(dir);
+    await seeded.recordAccepted({
+      messageId: 'om_legacy',
+      scope: 'oc_dm',
+      chatId: 'oc_dm',
+      senderId: 'ou_user',
+      content: 'legacy no-snapshot task',
+      acceptedAt: Date.now(),
+      chatType: 'p2p',
+    });
+    await seeded.flush();
+
+    const h = await startBridge({ journalDir: dir });
+    // Even with a current preference, the legacy record's missing snapshot means
+    // dispatch must NOT pass a model override (old-behaviour compatibility).
+    await h.sessions.setModelPreference('oc_dm', 'claude', 'should-be-ignored');
+    await waitFor(() => h.agent.runs.length === 1, 8000);
+    expect(h.agent.runOptions[0]?.model).toBeUndefined();
+  }, 20_000);
+});

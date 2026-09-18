@@ -81,7 +81,6 @@ interface CtxArgs {
   content: string;
   senderId?: string;
   agentId?: string;
-  hasPendingForScope?: (scope: string) => boolean;
   discoverModels?: (input: never) => Promise<ModelCatalogResult>;
   formValue?: Record<string, unknown>;
   scope?: string;
@@ -97,7 +96,6 @@ function commandContext(args: CtxArgs): CommandContext {
     workspaces: new WorkspaceStore('/tmp/ws.json'),
     agent: new FakeAgentAdapter({ id: args.agentId ?? 'claude', displayName: 'Claude Code' }),
     activeRuns: args.activeRuns,
-    hasPendingForScope: args.hasPendingForScope,
     discoverModels: args.discoverModels as CommandContext['discoverModels'],
     formValue: args.formValue,
     controls: controls(['ou-admin']),
@@ -258,12 +256,15 @@ describe('/model selection card (OPT-07 slice B)', () => {
     expect(lastMarkdown(channel)).toContain('仅管理员');
   });
 
-  it('card submit while busy is rejected, keeping the old value', async () => {
+  it('card submit applies even while a run is active (slice C: busy switching)', async () => {
     const channel = createFakeChannel();
     const sessions = await makeStore();
-    await sessions.setModelPreference('chat-1', 'claude', 'old');
+    await sessions.setModelPreference('chat-1', 'claude', 'old'); // revision -> 1
     const activeRuns = new ActiveRuns();
     const agent = new FakeAgentAdapter({ id: 'claude' });
+    // An in-flight run on the same scope must NOT block a model change; the
+    // running task keeps the snapshot it was dispatched with (verified at the
+    // dispatch layer), only future messages adopt the new choice.
     activeRuns.register('chat-1', agent.run({ runId: 'r', prompt: 'x' }));
     await runCommandHandler(
       'model',
@@ -277,8 +278,9 @@ describe('/model selection card (OPT-07 slice B)', () => {
         discoverModels: stubDiscover(),
       }),
     );
-    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('old');
-    expect(lastMarkdown(channel)).toContain('正在运行');
+    expect(sessions.getModelPreference('chat-1', 'claude')?.model).toBe('m1');
+    expect(sessions.getModelRevision('chat-1')).toBe(2);
+    expect(lastMarkdown(channel)).toContain('已保存');
   });
 });
 

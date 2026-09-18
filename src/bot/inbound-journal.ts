@@ -38,6 +38,12 @@ export interface InboundRecord {
   settledAt?: number;
   /** Set when the run reached a known terminal state. */
   terminalState?: string;
+  /** OPT-07 Slice C: immutable model snapshot captured when the message was
+   * accepted. Dispatch groups by this so a later `/model` change never
+   * rewrites an already-received (or queued) message's target model. Absent
+   * = no override (follow CLI) — also the fallback for records written before
+   * this field existed. */
+  model?: string;
   /** 重头重做 intent: the scope session must be reset (archive + clear, same
    * as /new) before this record's run resolves resume state and claims.
    * Cleared by runAgentBatch once executed. */
@@ -126,6 +132,7 @@ export class InboundJournal {
     acceptedAt: number;
     threadId?: string;
     chatType?: 'p2p' | 'group';
+    model?: string;
   }): Promise<'recorded' | 'duplicate' | 'failed'> {
     const k = key(input.scope, input.messageId);
     if (this.records.has(k)) return 'duplicate'; // duplicate delivery — idempotent
@@ -285,6 +292,10 @@ export class InboundJournal {
       status: 'queued',
       ...(record.threadId ? { threadId: record.threadId } : {}),
       ...(record.chatType ? { chatType: record.chatType } : {}),
+      // OPT-07 Slice C: redo preserves the ORIGINAL model snapshot — a plain
+      // 重头重做 must not silently re-target to the current model. Switching
+      // models on redo would be a separate, explicit action.
+      ...(record.model ? { model: record.model } : {}),
       ...(opts?.resetSession ? { resetSession: true } : {}),
     });
     const persisted = await this.persistScope(scope);

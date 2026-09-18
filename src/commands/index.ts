@@ -141,13 +141,6 @@ export interface CommandContext {
   activeRuns: ActiveRuns;
   processPool?: ProcessPool;
   runExecutor?: RunExecutor;
-  /**
-   * OPT-07: reports whether the scope currently has messages sitting in the
-   * PendingQueue (not yet flushed). `/model` uses it, together with
-   * activeRuns, to reject preference changes while a scope is busy. Optional
-   * so card-synthesized contexts (which never queue) can omit it.
-   */
-  hasPendingForScope?: (scope: string) => boolean;
   /** OPT-07 Slice B: injectable model-catalog discovery seam. Defaults to the
    * real backend discovery; tests pass a stub so `/model` never spawns a CLI. */
   discoverModels?: (input: DiscoverModelsInput) => Promise<ModelCatalogResult>;
@@ -543,9 +536,12 @@ async function handleModel(args: string, ctx: CommandContext): Promise<void> {
   }
 }
 
-/** Admin + revision-freshness + busy gates shared by every mutation
- * (text set, text reset, card submit). Replies and returns false when the
- * mutation must not proceed. */
+/** Admin + revision-freshness gates shared by every mutation (text set, text
+ * reset, card submit). Replies and returns false when the mutation must not
+ * proceed. OPT-07 Slice C: switching while a run is active or messages are
+ * queued is now ALLOWED — in-flight and already-received messages keep their
+ * frozen model snapshot (dispatch groups by it), so a change only affects
+ * messages accepted afterwards. */
 async function guardModelMutation(
   ctx: CommandContext,
   revisionArg: string | undefined,
@@ -561,14 +557,6 @@ async function guardModelMutation(
       await reply(ctx, '⚠️ 该选择卡已过期（模型设置已被更新），请重新打开 `/model`。');
       return false;
     }
-  }
-  const busy = modelBusyReason(ctx);
-  if (busy) {
-    await reply(
-      ctx,
-      `⚠️ ${busy}现在修改会让排队中的消息落到不确定的模型上，请等当前任务处理完再试。查看设置请用 \`/model\`。`,
-    );
-    return false;
   }
   return true;
 }
@@ -705,12 +693,6 @@ function modelScopeLabel(chatMode: 'p2p' | 'group' | 'topic'): string {
   if (chatMode === 'topic') return '当前话题（同话题成员共享）';
   if (chatMode === 'group') return '当前群（成员共享）';
   return '当前私聊';
-}
-
-function modelBusyReason(ctx: CommandContext): string | undefined {
-  if (ctx.activeRuns.get(ctx.scope)) return '当前会话有任务正在运行。';
-  if (ctx.hasPendingForScope?.(ctx.scope)) return '当前会话有排队中的消息尚未处理。';
-  return undefined;
 }
 
 function validateModelId(
