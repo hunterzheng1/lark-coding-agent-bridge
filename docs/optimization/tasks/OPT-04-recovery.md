@@ -67,6 +67,12 @@
 2. **spawn 前原子认领**：原实现先 spawn 后认领且吞掉持久化错误，崩溃窗口内磁盘仍为 queued，重启会重放已有副作用的任务。现 `startRunFlow` 新增 `beforeSpawn` 钩子在 `executor.submit` 前认领（临时 runId）；认领无法持久化（含 journal 不可写、记录缺失）时中止启动并向用户提示「取消本次启动」；运行开始后 `bindRun` 绑定真实 runId，绑定失败保守落为 uncertain（不自动重跑）并有失败日志。`markRejected` 扩展为同时落定 queued 与 claimed（executor 拒绝时无副作用，可安全落定）。补充 spawn 边界故障注入测试（journal 不可写 → 无运行 + 用户可见提示）与 `bindRun` 单测。
 3. **journal 写入串行化**：`persistScope` 此前未登记 `persistQueue`（并发转换可能旧快照后写覆盖新状态）。现按 scope 串行链写入；channel 断连流程增加 `inboundJournal.flush()` 与 `thinkingHistory.flush()`。新增并发写不丢数据测试。
 
+### 评审二轮修复（2026-09-18，`4840492`）
+
+1. **并发重复投递**：`recordAccepted` 在首个 await 前同步登记 reservation，`Promise.all` 并发同 id 投递只有一个 `recorded`；失败安全回滚（记录可重试）。新增并发投递测试。
+2. **停机 flush 时序**：`disconnect` 改两阶段——先断连接 + `stopAll`，再（有界 5s）等待全部在途终态回调（journal 落定、思考保存、完成通知）结束，最后才 flush 各存储。终态回调经 `trackSettle` 登记，正常停机后 journal 不会停留 claimed、思考记录不再缺失。
+3. **恢复卡持久化回滚**：`markDismissed`/`redo` 在 `persistScope` 失败时回滚内存变更并返回失败；dispatcher 区分「已处理过」与「⚠️ 暂时无法写入请重试」，不再在磁盘不可写时误报忽略成功。
+
 ### 剩余事项
 
 - ~~分片 4：恢复通知目前是 markdown 文本，没有结构化恢复卡~~ 已实施（`953ca1f`），并按用户确认显式拆分两种语义（`d6ee860`）：uncertain 卡三动作——「💬 继续对话」保留会话、派发【恢复】引导文案由 agent 检查进度后接着做；「♻️ 重头重做」重置会话（归档 catalog active 条目 + 清 session store，等价 /new）后按原文完整重跑；「忽略」。「重头重做」的重置只影响该 scope 的会话绑定，权限默认值与工作目录不变，派发时仍走完整策略校验。expired（从未派发）卡两动作——「▶️ 现在执行」（原文派发，不重置会话）与忽略。全部幂等。
