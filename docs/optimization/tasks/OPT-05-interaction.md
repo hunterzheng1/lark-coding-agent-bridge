@@ -64,7 +64,7 @@
 | taskList | ✗ | ✗ | ✗ | 无结构化 plan/task 事件映射 |
 | steer | ✗ | ✗ | ✗ | 运行中补充消息维持既有"下一轮"排队语义 |
 
-已接线的唯一消费点：`/thinking` 在 `thinkingEvents=false` 的后端上明确答复"该 agent 不产生思考事件"，替代笼统的"暂无记录"。矩阵的契约测试（5 项）防止后续未经声明就开放交互控制。
+评审修复（`bedbc7e`）：`supportsNativeHistory` 改为 `interactions.nativeHistory` 的派生值，能力声明只剩一个事实来源。已接线的消费点：`/thinking` 在 `thinkingEvents=false` 的后端上明确答复，且运行中有任务时提示当前运行尚未保存（OPT-06 关联）。"该 agent 不产生思考事件"，替代笼统的"暂无记录"。矩阵的契约测试（5 项）防止后续未经声明就开放交互控制。
 
 ### 未实施：纵向交互闭环（规格第二分片）
 

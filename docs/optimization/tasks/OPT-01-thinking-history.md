@@ -99,3 +99,5 @@ CodeBuddy 在 `src/agent/codebuddy/adapter.ts` 复用 `src/agent/claude/stream-j
 - 保留期/容量未做成用户可配置项（默认值已文档化）。
 - 终态卡片无 `/thinking` 按钮（回调鉴权语义限制，见上）。
 - 用户现场（真实 CodeBuddy 卡片、真实手机端）未验证；本机运行中的 0.3.17 服务未重启加载新代码。
+- 评审修复（`bedbc7e`）：`/thinking` 在 scope 有活动运行时明确提示「当前运行尚未保存」，并把回复标注为上一轮已保存记录，避免误认为当前任务的思考。
+- （部署更新 2026-09-18：本机三 profile 已改跑含 OPT 分片的本地构建，npm registry 未发布。）

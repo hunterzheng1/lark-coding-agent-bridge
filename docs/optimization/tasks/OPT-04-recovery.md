@@ -1,6 +1,6 @@
 # OPT-04：入站持久化、去重与恢复
 
-状态：分片 1–3 已实施（commit `1b95117`），分片 4 已实施（commit `953ca1f`：结构化恢复卡 + 重做/忽略动作）。本地验证通过、现场未验证。优先级 P1。实施记录见文末。
+状态：分片 1–4 已实施（`1b95117`、`953ca1f`），评审修复已完成（`bedbc7e`：重复投递拦截、spawn 前原子认领、持久化串行化、操作人绑定）。本地验证通过（ci:local 767/767）、现场未验证。优先级 P1。实施记录见文末。
 
 ## 问题
 
@@ -58,6 +58,14 @@
 - 红灯：`tests/unit/bot/inbound-journal.test.ts` 10 项（去重/claim/terminal/rejected/隔离/恢复分类/重载/损坏容忍/落盘失败//new 清理/保留期）在实现前失败，实现后通过。
 - 新增 `tests/integration/bot/inbound-recovery.test.ts` 4 项端到端：完整生命周期落定（恢复集为空）、崩溃窗口内已落盘消息重启后经 pending 流重放执行且重新落定、uncertain 通知且不产生新运行、重复投递不双记。
 - 全量 `pnpm test` 107 文件 736 项：仅既有 `logger.test.ts` 2 项失败（基线已存在）。`pnpm typecheck` 通过。thinking-history e2e 的 waitFor 上限由 3s 放宽到 10s 消除并行抖动（曾出现一次全量下的超时抖动）。
+
+### 评审修复（2026-09-18，`bedbc7e`）
+
+评审发现两处会导致任务重复执行的阻断问题，均已修复并补测试：
+
+1. **重复投递拦截**：`recordAccepted` 返回 `duplicate` 时 intake 直接结束（原实现仍无条件 `pending.push`，同一事件可能拼入运行中 Prompt 或启动第二次运行）。新增集成测试：终态后重投递不再执行、合批窗口内双投递恰好一次运行。
+2. **spawn 前原子认领**：原实现先 spawn 后认领且吞掉持久化错误，崩溃窗口内磁盘仍为 queued，重启会重放已有副作用的任务。现 `startRunFlow` 新增 `beforeSpawn` 钩子在 `executor.submit` 前认领（临时 runId）；认领无法持久化（含 journal 不可写、记录缺失）时中止启动并向用户提示「取消本次启动」；运行开始后 `bindRun` 绑定真实 runId，绑定失败保守落为 uncertain（不自动重跑）并有失败日志。`markRejected` 扩展为同时落定 queued 与 claimed（executor 拒绝时无副作用，可安全落定）。补充 spawn 边界故障注入测试（journal 不可写 → 无运行 + 用户可见提示）与 `bindRun` 单测。
+3. **journal 写入串行化**：`persistScope` 此前未登记 `persistQueue`（并发转换可能旧快照后写覆盖新状态）。现按 scope 串行链写入；channel 断连流程增加 `inboundJournal.flush()` 与 `thinkingHistory.flush()`。新增并发写不丢数据测试。
 
 ### 剩余事项
 
