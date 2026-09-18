@@ -1,6 +1,6 @@
 # OPT-07：会话模型选择
 
-日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）与 Slice B（选择卡与目录发现）已实施并本地验证通过（`pnpm ci:local` 全绿）；Slice C（忙时快照与恢复一致性）尚未实施。以下交互、权限和一致性规则属于设计建议，实施取舍见文末「实施记录：Slice A」「实施记录：Slice B」。
+日期：2026-09-18。源码基线：`6573d54`。状态：Slice A（命令闭环）、Slice B（选择卡与目录发现）、Slice C（忙时切换与恢复一致性）均已实施并本地验证通过（各轮 `pnpm ci:local` 全绿）；现场/真机验证仍未执行。以下交互、权限和一致性规则属于设计建议，实施取舍见文末三段「实施记录」。
 
 ## 目标与结论
 
@@ -202,3 +202,36 @@
 - 命令与卡片回调（出卡、文本列表、submit 应用/过期/越权/忙时拒绝、手动保留字、按后端隔离、不清队列）：`tests/integration/commands/model-command.test.ts`。
 
 模型真实可用性、续接覆盖与飞书移动端交互仍需现场验证，本轮未触发付费模型调用。
+
+## 实施记录：Slice C（2026-09-18，基线 `1de794a` 之后）
+
+交付 Slice C「忙时切换与恢复一致性」，`pnpm ci:local` 全绿（typecheck、853 测试、build，较 B 增 10 项）。OPT-07 三个切片至此全部实现；现场/真机验证仍未执行。
+
+### 入站模型快照与合批（rule 5/6/7）
+
+- `InboundRecord.model`：普通消息被 `recordAccepted` 持久化接收时，冻结其 scope+agent 的当前模型覆盖为不可变快照（缺省=无覆盖/跟随 CLI）。之后 `/model` 改动不回写已接收（含排队中）消息的目标模型。
+- `onFlush` 按每条消息落盘的快照，将一次 flush 拆成「连续同快照」的分组，逐组 `await runAgentBatch`（ActiveRuns 每 scope 单运行，故串行）。不同快照永不合入一个 prompt；非相邻同快照也不跨序合并。`runAgentBatch` 改用分组的显式 `model`，不再于派发时读全局可变偏好。
+- 崩溃恢复：`recoverOnStartup` requeue 的记录按其原快照派发；`redo()` 保留原始快照（普通重做不静默改目标模型；「用当前模型重做」若要做须作为独立动作，本轮未加）。老日志无 `model` 字段→无覆盖，沿用旧行为。两组间若停机，未运行记录的 journal 仍为 `queued`，下次启动重放。
+
+### 允许忙时切换（替换 A/B 的忙时拒绝）
+
+- `guardModelMutation` 去掉忙时闸门，仅保留管理员校验 + revision 新鲜度校验。因为运行中任务与排队消息各自持快照，切换只影响其后接收的消息，不重启、不改写进行中任务。
+- 移除随之失效的 `hasPendingForScope` 接线（CommandContext 字段、intake/dispatcher 注入）与 `PendingQueue.has`；`commandKeepsPendingQueue`（A）保留，`/model` 仍不清空队列。
+
+### 实际模型展示（acceptance「实际模型展示」）
+
+- `RunState.reportedModel`：仅当上游 `system` 事件报告 model 时记录（Codex/CodeBuddy 未报告则不填），绝不猜测。
+- `formatModelNoticeSegment`（纯函数）：完成通知里如实呈现——报告了就显示「本次模型：<reported>」（与请求值不一致也照报）；只请求未获确认则「请求模型：<req>（未收到实际模型确认）」；没请求则不加噪声。
+
+### 仍未做
+
+- 最近使用、跨 Agent 选择、推理强度/个人预设；恢复卡「用当前模型重做」的独立入口。
+- 候选是否账号可调用、续接是否覆盖上次模型、飞书移动端点击/重复回调/过期卡、真机快照/合批行为：均只源码级与本机只读核对，未跑真实模型请求或飞书点击，需现场验证。
+
+### 验证（新增）
+
+- 快照合批/顺序、停机 requeue 沿用原快照、老日志无字段不覆盖：`tests/integration/bot/inbound-recovery.test.ts`（复用 OPT-04 e2e 栈）。
+- 分组纯函数、通知片段纯函数、journal 快照持久化与 redo 保留：`tests/unit/bot/model-snapshot.test.ts`。
+- 命令层忙时切换现为允许：`tests/integration/commands/model-command.test.ts`。
+
+OPT-04 的 claim/terminal/uncertain/停机跟踪等既有用例在本轮全量回归中保持全绿。
