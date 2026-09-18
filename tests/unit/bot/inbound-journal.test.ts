@@ -228,3 +228,57 @@ describe('InboundJournal pre-spawn claim + bindRun (评审修复)', () => {
     expect(j2.list('oc_chat1').map((r) => r.messageId).sort()).toEqual(['om_a', 'om_b']);
   });
 });
+
+describe('InboundJournal 并发与持久化失败回滚（评审二轮）', () => {
+  it('concurrent duplicate deliveries: exactly one recorded, one duplicate', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    // True concurrency — both enter recordAccepted before either persists.
+    const [r1, r2] = await Promise.all([
+      j.recordAccepted(accepted({ messageId: 'om_race' })),
+      j.recordAccepted(accepted({ messageId: 'om_race' })),
+    ]);
+    const results = [r1, r2].sort();
+    expect(results).toEqual(['duplicate', 'recorded']);
+    expect(j.list('oc_chat1')).toHaveLength(1);
+  });
+
+  it('concurrent distinct deliveries are all recorded', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    const [r1, r2] = await Promise.all([
+      j.recordAccepted(accepted({ messageId: 'om_x' })),
+      j.recordAccepted(accepted({ messageId: 'om_y' })),
+    ]);
+    expect([r1, r2]).toEqual(['recorded', 'recorded']);
+    expect(j.list('oc_chat1')).toHaveLength(2);
+  });
+
+  it('markDismissed persist failure returns false and keeps the record actionable', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_d' }));
+    await j.markClaimed('oc_chat1', ['om_d'], 'run-1');
+    await j.recoverOnStartup(); // → uncertain
+    // Break the journal dir: replace it with a file so writes fail.
+    await rm(dir, { recursive: true, force: true });
+    await writeFile(dir, 'occupied', 'utf8');
+
+    expect(await j.markDismissed('oc_chat1', 'om_d')).toBe(false);
+    // In-memory mutation rolled back — the record stays actionable.
+    expect(j.getRecord('oc_chat1', 'om_d')?.status).toBe('uncertain');
+  });
+
+  it('redo persist failure returns undefined and keeps the record actionable', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_r' }));
+    await j.markClaimed('oc_chat1', ['om_r'], 'run-1');
+    await j.recoverOnStartup();
+    await rm(dir, { recursive: true, force: true });
+    await writeFile(dir, 'occupied', 'utf8');
+
+    expect(await j.redo('oc_chat1', 'om_r')).toBeUndefined();
+    expect(j.getRecord('oc_chat1', 'om_r')?.status).toBe('uncertain');
+  });
+});

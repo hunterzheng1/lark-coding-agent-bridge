@@ -139,3 +139,36 @@ describe('OPT-03 评审修复: guaranteed-minimal error skeleton', () => {
     expect(body).not.toContain('UNIQUE_TAIL_987654321');
   });
 });
+
+describe('OPT-03 评审二轮: skeleton clamps every dynamic field', () => {
+  it('an unbounded tool name is clamped into the running skeleton budget', () => {
+    const hugeTool = 'T'.repeat(10_000);
+    const state = buildState({ text: '长'.repeat(4000), thinking: '思'.repeat(1500) });
+    const card = renderCardBounded(state, {
+      budgetBytes: 2_500,
+      progress: {
+        elapsedMs: 60_000,
+        idleMs: 0,
+        completedTools: 1,
+        inFlightTools: 1,
+        currentTool: hugeTool,
+      },
+    });
+    expect(wireBytes(card)).toBeLessThanOrEqual(2_500);
+    expect(JSON.stringify(card)).not.toContain(hugeTool);
+    // Stop control survives even in the skeleton.
+    expect(hasStopButton(card)).toBe(true);
+  });
+
+  it('pathological tiny budgets fall back to a fixed-text card', () => {
+    const state = buildState({
+      text: '长'.repeat(4000),
+      thinking: '思'.repeat(1500),
+      error: 'E'.repeat(500),
+    });
+    const card = renderCardBounded(state, { budgetBytes: 240 });
+    expect(wireBytes(card)).toBeLessThanOrEqual(240);
+    // Failure information still surfaces in constant form.
+    expect(JSON.stringify(card)).toContain('已结束');
+  });
+});

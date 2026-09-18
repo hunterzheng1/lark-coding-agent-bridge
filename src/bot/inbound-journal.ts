@@ -107,6 +107,11 @@ export class InboundJournal {
    * Resolves 'failed' when persistence failed — callers must not claim
    * durable receipt in that case. 'duplicate' is the idempotent no-op for a
    * redelivered event.
+   *
+   * The reservation is registered synchronously before the first await: two
+   * concurrent deliveries of the same event id cannot both pass the check.
+   * On any failure the reservation is rolled back so a later delivery (or
+   * restart replay) can retry cleanly.
    */
   async recordAccepted(input: {
     messageId: string;
@@ -120,16 +125,15 @@ export class InboundJournal {
   }): Promise<'recorded' | 'duplicate' | 'failed'> {
     const k = key(input.scope, input.messageId);
     if (this.records.has(k)) return 'duplicate'; // duplicate delivery — idempotent
+    // Synchronous reservation — no await before this point.
+    this.records.set(k, { ...input, status: 'queued' });
     try {
       await mkdir(this.dir, { recursive: true });
     } catch (err) {
+      this.records.delete(k); // roll back the reservation
       log.fail('inbound', err, { step: 'mkdir', scope: input.scope });
       return 'failed';
     }
-    this.records.set(k, {
-      ...input,
-      status: 'queued',
-    });
     return (await this.persistScope(input.scope)) ? 'recorded' : 'failed';
   }
 
@@ -253,6 +257,7 @@ export class InboundJournal {
     const record = this.records.get(key(scope, messageId));
     if (!record) return undefined;
     if (record.status !== 'uncertain' && record.status !== 'expired') return undefined;
+    const prevStatus = record.status;
     record.status = 'terminal';
     record.terminalState = 'redone';
     record.settledAt = this.now();
@@ -269,19 +274,40 @@ export class InboundJournal {
       ...(record.threadId ? { threadId: record.threadId } : {}),
       ...(record.chatType ? { chatType: record.chatType } : {}),
     });
-    await this.persistScope(scope);
+    const persisted = await this.persistScope(scope);
+    if (!persisted) {
+      // Roll back the in-memory mutations: the record must stay actionable
+      // (the recovery card remains valid and the user can retry).
+      record.status = prevStatus;
+      record.terminalState = undefined;
+      record.settledAt = undefined;
+      this.records.delete(key(scope, newId));
+      return undefined;
+    }
     return newId;
   }
 
-  /** Recovery-card "忽略": settle an uncertain/expired record as dismissed. */
-  async markDismissed(scope: string, messageId: string): Promise<void> {
+  /**
+   * Recovery-card "忽略": settle an uncertain/expired record as dismissed.
+   * Resolves false when persistence failed (the in-memory mutation is rolled
+   * back so the record stays actionable and the card remains truthful).
+   */
+  async markDismissed(scope: string, messageId: string): Promise<boolean> {
     const record = this.records.get(key(scope, messageId));
-    if (!record) return;
-    if (record.status !== 'uncertain' && record.status !== 'expired') return;
+    if (!record) return true;
+    if (record.status !== 'uncertain' && record.status !== 'expired') return true;
+    const prevStatus = record.status;
     record.status = 'terminal';
     record.terminalState = 'dismissed';
     record.settledAt = this.now();
-    await this.persistScope(scope);
+    const persisted = await this.persistScope(scope);
+    if (!persisted) {
+      record.status = prevStatus;
+      record.terminalState = undefined;
+      record.settledAt = undefined;
+      return false;
+    }
+    return true;
   }
 
   /**

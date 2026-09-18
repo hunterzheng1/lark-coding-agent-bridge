@@ -49,7 +49,7 @@ describe('agent capability contract', () => {
       agentId: 'codex',
       sessionKind: 'codex-thread',
       promptInjection: 'stdin-prefix',
-      supportsNativeHistory: false,
+      supportsNativeHistory: true,
       systemPrompt: BRIDGE_SYSTEM_PROMPT,
       permissions: {
         maxAccess: 'workspace',
@@ -194,7 +194,8 @@ describe('OPT-05: interaction capability matrix', () => {
 
   it('native history matches supportsNativeHistory', () => {
     expect(capabilityForAgentKind('claude', profile()).interactions.nativeHistory).toBe(true);
-    expect(capabilityForAgentKind('codex', profile()).interactions.nativeHistory).toBe(false);
+    // /resume lists Codex threads via codexHistoryProvider (handleResume).
+    expect(capabilityForAgentKind('codex', profile()).interactions.nativeHistory).toBe(true);
     expect(capabilityForAgentKind('codebuddy', profile()).interactions.nativeHistory).toBe(true);
   });
 

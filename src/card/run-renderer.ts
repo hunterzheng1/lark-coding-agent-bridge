@@ -59,17 +59,40 @@ export function renderCardBounded(state: RunState, options: RunCardRenderOptions
     if (wireBytes(last) <= budget) return last;
   }
   const skeleton = renderErrorSkeleton(state, options);
-  // The skeleton clamps every unbounded field; it always fits in practice.
-  return skeleton;
+  if (wireBytes(skeleton) <= budget) return skeleton;
+  // The skeleton still overflows (pathological budgets): fall back to a card
+  // made of fixed short texts only — no dynamic fields at all.
+  return renderFixedFallback(state);
 }
 
-const SKELETON_ERROR_CHARS = 400;
+const SKELETON_ERROR_CHARS = 200;
+const SKELETON_TOOL_CHARS = 24;
 
-/** Last-resort card: terminal status + clamped error + stop control only. */
+function clampText(s: string, max: number, suffix = '…'): string {
+  return s.length > max ? `${sliceCodeUnits(s, max)}${suffix}` : s;
+}
+
+function sliceCodeUnits(s: string, max: number): string {
+  let cut = max;
+  const last = s.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return s.slice(0, cut);
+}
+
+/** Last-resort card: terminal status + clamped error/tool + stop control. */
 function renderErrorSkeleton(state: RunState, options: RunCardRenderOptions): object {
   const elements: object[] = [];
   if (state.terminal === 'running' && options.progress) {
-    elements.push(progressStatus(options.progress));
+    // Upstream tool names are unbounded — clamp before they enter the wire.
+    const tool = options.progress.currentTool
+      ? clampText(options.progress.currentTool, SKELETON_TOOL_CHARS)
+      : undefined;
+    const activity = tool && options.progress.inFlightTools > 0 ? `🧰 当前工具 ${tool}` : '🟢 进程仍在运行';
+    elements.push(
+      noteMd(
+        `⏳ 运行中 · 已 ${formatMinutes(options.progress.elapsedMs)} · 已完成 ${options.progress.completedTools} 个工具 · ${activity}`,
+      ),
+    );
   }
   if (state.terminal === 'interrupted') {
     elements.push(noteMd('_⏹ 已被中断_'));
@@ -78,17 +101,14 @@ function renderErrorSkeleton(state: RunState, options: RunCardRenderOptions): ob
     elements.push(noteMd(`_⏱ ${mins} 分钟无响应,已自动终止_`));
   } else if (state.terminal === 'error') {
     const raw = state.errorMsg ?? '未知错误';
-    const clamped =
-      raw.length > SKELETON_ERROR_CHARS
-        ? `${raw.slice(0, SKELETON_ERROR_CHARS)}…（完整错误见 /doctor 日志）`
-        : raw;
+    const clamped = `${clampText(raw, SKELETON_ERROR_CHARS)}（完整错误见 /doctor 日志）`;
     elements.push(noteMd(`⚠️ agent 失败：${clamped}`));
   } else if (state.terminal === 'done') {
     elements.push(noteMd('_（正文过长已折叠）回复 /last full 查看完整结果_'));
   }
   if (state.terminal === 'running') {
-    if (state.footer) elements.push(footerStatus(state.footer));
-    elements.push(stopButton(options));
+    // Unsigned stop button — same trust level as typing /stop.
+    elements.push(stopButton({}));
   }
   return {
     schema: '2.0',
@@ -97,6 +117,23 @@ function renderErrorSkeleton(state: RunState, options: RunCardRenderOptions): ob
       summary: { content: summaryText(state) },
     },
     body: { elements },
+  };
+}
+
+/** Absolute fallback: constant short strings, no dynamic content at all. */
+function renderFixedFallback(state: RunState): object {
+  const running = state.terminal === 'running';
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: running,
+      summary: { content: running ? '运行中' : '已结束' },
+    },
+    body: {
+      elements: [
+        noteMd(running ? '⏳ 任务仍在运行，内容已省略。' : '任务已结束，内容已省略。/doctor 查看日志。'),
+      ],
+    },
   };
 }
 

@@ -245,9 +245,13 @@ async function handleInboundRecoveryAction(
   }
 
   if (input.cmd === 'inbound.dismiss') {
-    await journal.markDismissed(input.scope, input.messageId);
-    log.info('inbound', 'recovery-dismiss', { scope: input.scope, messageId: input.messageId });
-    send('✓ 已忽略该恢复记录。');
+    const dismissed = await journal.markDismissed(input.scope, input.messageId);
+    log.info('inbound', 'recovery-dismiss', {
+      scope: input.scope,
+      messageId: input.messageId,
+      persisted: dismissed,
+    });
+    send(dismissed ? '✓ 已忽略该恢复记录。' : '⚠️ 恢复记录暂时无法写入，稍后可重试忽略。');
     return;
   }
 
@@ -257,7 +261,16 @@ async function handleInboundRecoveryAction(
       senderId: clicker,
     });
     if (!newId) {
-      send('该恢复记录已处理过。');
+      // Distinguish "already settled" from "persistence failed, record is
+      // still actionable" — the latter must invite a retry, not a no-op.
+      const rec = journal.getRecord(input.scope, input.messageId);
+      const stillActionable =
+        rec && (rec.status === 'uncertain' || rec.status === 'expired');
+      send(
+        stillActionable
+          ? '⚠️ 恢复记录暂时无法写入，请稍后重试。'
+          : '该恢复记录已处理过。',
+      );
       return;
     }
     const m = recoveryMessageFrom(record, newId);

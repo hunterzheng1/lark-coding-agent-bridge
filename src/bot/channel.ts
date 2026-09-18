@@ -288,6 +288,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           activePolicyFingerprints,
           scope,
           mode,
+          trackSettle,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -496,6 +497,20 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     forceReconnect: () => controls.restart(),
   });
 
+  // OPT-04: in-flight terminal callbacks (journal settle, thinking save,
+  // completion notice) are tracked so a graceful shutdown can wait for them
+  // before flushing the stores they write to.
+  const pendingSettles = new Set<Promise<unknown>>();
+  const trackSettle = (p: Promise<unknown>): Promise<unknown> => {
+    const tracked = p
+      .catch(() => undefined)
+      .finally(() => {
+        pendingSettles.delete(tracked);
+      });
+    pendingSettles.add(tracked);
+    return tracked;
+  };
+
   return {
     channel,
     disconnect: async () => {
@@ -504,9 +519,20 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       knownChatsRefresh.stop();
       keepalive.stop();
       pending.cancelAll();
-      const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
+      // Phase 1: tear down the connection and stop runs.
+      const [disconnectResult, stopAllResult] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
+      ]);
+      // Phase 2: wait (bounded) for terminal callbacks to finish writing.
+      if (pendingSettles.size > 0) {
+        await Promise.race([
+          Promise.allSettled([...pendingSettles]),
+          new Promise((resolve) => setTimeout(resolve, 5_000)),
+        ]);
+      }
+      // Phase 3: flush every store only after all writers have settled.
+      const flushResults = await Promise.allSettled([
         sessions.flush(),
         sessionCatalog?.flush(),
         callbackNonceStore?.flush(),
@@ -760,6 +786,8 @@ interface RunBatchDeps {
   activePolicyFingerprints: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  /** Registers in-flight terminal callbacks so shutdown can await them. */
+  trackSettle?: (p: Promise<unknown>) => Promise<unknown>;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -778,6 +806,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     activePolicyFingerprints,
     scope,
     mode,
+    trackSettle,
   } = deps;
   if (batch.length === 0) return;
   const firstMsg = batch[0];
@@ -993,8 +1022,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       if (fullText.trim()) sessions.setLastRunOutput(scope, fullText);
       const baseNotice = buildTerminalNotice(state, { mins, toolCount, truncated, failedTools });
       // Persist the run's thinking before advertising the /thinking entry —
-      // a failed save must not produce a dead hint (OPT-01B).
-      void (async () => {
+      // a failed save must not produce a dead hint (OPT-01B). Tracked so a
+      // graceful shutdown waits for the journal/thinking writes (OPT-04).
+      void trackSettle?.((async () => {
         // OPT-04: the run reached a known terminal state — journal it so a
         // restart never classifies this batch as uncertain. A failed settle
         // leaves the record claimed (→ uncertain, never auto-rerun) and is
@@ -1032,7 +1062,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           });
         }
         await channel.send(chatId, { markdown: notice }, sendOpts);
-      })().catch((err) => log.fail('stream', err, { step: 'completion' }));
+      })().catch((err) => log.fail('stream', err, { step: 'completion' })));
     },
   };
 

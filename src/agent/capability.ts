@@ -78,7 +78,8 @@ export function codexCapability(profile: Pick<ProfileConfig, 'permissions'>): Ag
     thinkingEvents: false,
     incrementalText: true,
     usageEvents: true,
-    nativeHistory: false,
+    // /resume lists and restores Codex threads via codexHistoryProvider.
+    nativeHistory: true,
     inputRequest: false,
     toolApproval: false,
     taskList: false,
