@@ -185,6 +185,13 @@ export interface StartChannelDeps {
   inboundJournal?: InboundJournal;
   controls: Controls;
   appPaths?: Pick<AppPaths, 'secretsFile' | 'keystoreSaltFile' | 'mediaDir'>;
+  /**
+   * How long a stuck shutdown drain may go before escalating to repeating
+   * `disconnect/drain-stuck` warnings. Observability only — disconnect never
+   * flushes or returns before every tracked batch has settled regardless of
+   * this value. Default: agent stop grace + 10s.
+   */
+  shutdownDrainWarnMs?: number;
 }
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
@@ -307,6 +314,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             shutdown.signal,
             'chat-mode',
             chatModeCache.resolve(channel, firstMsg.chatId),
+            trackSettle,
           );
           const mode: ChatMode = firstMsg.threadId ? 'topic' : resolvedMode;
           await runAgentBatch({
@@ -328,7 +336,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             shutdownSignal: shutdown.signal,
           });
         } catch (err) {
-          log.fail('flush', err);
+          if (err instanceof BridgeShutdownCancelled) {
+            // Expected graceful-shutdown cancellation, not a failure —
+            // keep it out of error telemetry (评审六轮).
+            log.info('flush', 'cancelled-by-shutdown', { scope, label: err.label });
+          } else {
+            log.fail('flush', err);
+          }
         } finally {
           pending.unblock(scope);
           log.info('flush', 'end');
@@ -553,25 +567,30 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         channel.disconnect(),
         activeRuns.stopAll(),
       ]);
-      // Phase 2: wait for ALL tracked batches to genuinely settle (finish or
-      // cancel-land). The only thing that could still be pending after the
-      // Phase-0 abort is a spawn-in-flight batch winding down through its
-      // terminal callbacks — bounded by the agent's own stop grace, so we
-      // size the deadline off that rather than a fixed 3s. The deadline is a
-      // pathological guard only (e.g. a wedged terminal writer); timing out
-      // logs loudly instead of silently flushing early.
-      const settleDeadline = Date.now() + getAgentStopGraceMs(controls.cfg) + 10_000;
-      while (pendingSettles.size > 0 && Date.now() < settleDeadline) {
+      // Phase 2: wait for ALL tracked batches to genuinely settle (finish,
+      // cancel-land, or see their abandoned-but-uncancellable network work
+      // run out). There is deliberately NO early-return deadline (评审六轮
+      // P1): flushing stores and returning while pendingSettles is non-empty
+      // is the exact data-loss window this task exists to close — a wedged
+      // writer now keeps shutdown blocked (a force-kill falls back to the
+      // journal's crash-recovery semantics), and the threshold below only
+      // escalates to repeating warnings for observability.
+      const warnEveryMs = deps.shutdownDrainWarnMs ?? getAgentStopGraceMs(controls.cfg) + 10_000;
+      let nextWarnAt = Date.now() + warnEveryMs;
+      const drainStartedAt = Date.now();
+      while (pendingSettles.size > 0) {
         await Promise.race([
           Promise.allSettled([...pendingSettles]),
           new Promise((resolve) => setTimeout(resolve, 100)),
         ]);
-      }
-      if (pendingSettles.size > 0) {
-        log.warn('disconnect', 'drain-timeout', {
-          pending: pendingSettles.size,
-          note: 'flushing stores with batches still settling',
-        });
+        if (pendingSettles.size > 0 && Date.now() >= nextWarnAt) {
+          log.warn('disconnect', 'drain-stuck', {
+            pending: pendingSettles.size,
+            waitedMs: Date.now() - drainStartedAt,
+            note: 'shutdown is blocked until these settle; force-kill falls back to crash recovery',
+          });
+          nextWarnAt = Date.now() + warnEveryMs;
+        }
       }
       // Phase 3: flush every store only after all writers have settled.
       const flushResults = await Promise.allSettled([
@@ -598,16 +617,43 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
 }
 
 /**
- * OPT-04 (评审五轮): race a pre-spawn network await against the shutdown
- * signal. When abort fires, the batch breaks out immediately; the underlying
- * promise keeps running but nobody waits on it (its results are discarded —
- * safe because the batch never reached spawn). Only ever wrap PRE-spawn
- * awaits: local claim/terminal writes must be awaited fully, not raced.
+ * Expected cancellation raised when graceful shutdown aborts a pre-spawn
+ * await. Distinct from failures so the flush path can log it as info
+ * instead of error telemetry.
  */
-function raceShutdown<T>(signal: AbortSignal, label: string, work: Promise<T>): Promise<T> {
-  if (signal.aborted) return Promise.reject(new Error(`bridge-shutdown:${label}`));
+class BridgeShutdownCancelled extends Error {
+  constructor(readonly label: string) {
+    super(`bridge-shutdown:${label}`);
+    this.name = 'BridgeShutdownCancelled';
+  }
+}
+
+/**
+ * OPT-04 (评审五轮/六轮): race a pre-spawn network await against the shutdown
+ * signal. When abort fires the batch breaks out immediately, but the
+ * underlying task CANNOT be aborted (the SDK's REST/download calls take no
+ * AbortSignal) and keeps running — so it is handed to `trackAbandoned`
+ * (trackSettle) and graceful shutdown keeps waiting until its side effects
+ * (file writes, cache renames) finish. Never return while such work is in
+ * flight: a restarted instance must not race the old one over the shared
+ * media cache. Only ever wrap PRE-spawn awaits: local claim/terminal writes
+ * must be awaited fully, not raced.
+ */
+function raceShutdown<T>(
+  signal: AbortSignal,
+  label: string,
+  work: Promise<T>,
+  trackAbandoned: (p: Promise<unknown>) => void,
+): Promise<T> {
+  if (signal.aborted) {
+    trackAbandoned(work);
+    return Promise.reject(new BridgeShutdownCancelled(label));
+  }
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(new Error(`bridge-shutdown:${label}`));
+    const onAbort = (): void => {
+      trackAbandoned(work);
+      reject(new BridgeShutdownCancelled(label));
+    };
     signal.addEventListener('abort', onAbort, { once: true });
     work.then(
       (value) => {
@@ -893,6 +939,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     shutdownSignal,
     'media-resolve',
     media.resolve(resourceItems, controls.profileConfig.attachments),
+    trackSettle,
   );
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
@@ -925,6 +972,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       shutdownSignal,
       'quote-fetch',
       fetchQuotedContext(channel, targetId),
+      trackSettle,
     );
     if (q) {
       quotes.push(q);
@@ -989,7 +1037,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
   if (shutdownSignal.aborted) {
-    throw new Error('bridge-shutdown:pre-spawn');
+    throw new BridgeShutdownCancelled('pre-spawn');
   }
   const flow = await startRunFlow({
     scopeId: scope,
@@ -1018,6 +1066,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             maxMessages: 40,
             excludeIds: new Set([...batchIds, ...quoteTargets]),
           }),
+          trackSettle,
         );
         if (topicContext.length > 0) {
           log.info('topic', 'context-fetched', { scope, threadId, count: topicContext.length });

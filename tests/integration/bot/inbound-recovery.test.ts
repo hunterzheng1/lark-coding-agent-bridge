@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import type { AgentEvent } from '../../../src/agent/types';
 import { InboundJournal } from '../../../src/bot/inbound-journal.js';
+import { log } from '../../../src/core/logger.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { FakeAgentAdapter } from '../../helpers/fake-agent.js';
@@ -74,6 +75,8 @@ interface HarnessDeps {
   /** Externally seeded journal — takes precedence over journalDir. */
   journal?: InboundJournal;
   events?: AgentEvent[];
+  /** startChannel's shutdownDrainWarnMs (stuck-drain warn escalation only). */
+  drainWarnMs?: number;
 }
 
 async function startBridge(deps: HarnessDeps): Promise<{
@@ -115,6 +118,7 @@ async function startBridge(deps: HarnessDeps): Promise<{
     thinkingHistory: undefined,
     inboundJournal: journal,
     controls,
+    shutdownDrainWarnMs: deps.drainWarnMs,
   });
   cleanups.push(() => bridge.disconnect());
 
@@ -445,15 +449,17 @@ describe('优雅停机显式取消（评审五轮）', () => {
     expect(h.agent.runs).toHaveLength(0);
   }, 30_000);
 
-  it('disconnect cancels a hung pre-spawn quote fetch and leaves the record queued for replay', async () => {
+  it('disconnect cancels a slow pre-spawn quote fetch but keeps tracking its side effects', async () => {
     const dir = await mkdtempInbound();
     const h = await startBridge({ journalDir: dir });
-    // The quote fetch's REST call never resolves — the exact hang the old
-    // fixed 3s cap papered over by flushing and returning early.
+    // The quote fetch's REST call cannot be aborted (no AbortSignal in the
+    // SDK). It only settles after 700ms — disconnect must wait for that
+    // abandoned side effect instead of returning the moment the batch
+    // breaks out (评审六轮 P2).
     let quoteRequested = false;
-    (h.channel as unknown as { fetchRawMessage: () => Promise<never> }).fetchRawMessage = () => {
+    (h.channel as unknown as { fetchRawMessage: () => Promise<unknown> }).fetchRawMessage = () => {
       quoteRequested = true;
-      return new Promise<never>(() => {});
+      return new Promise((resolve) => setTimeout(() => resolve([]), 700));
     };
     await h.channel.handlers.message?.(
       {
@@ -464,17 +470,59 @@ describe('优雅停机显式取消（评审五轮）', () => {
     // Deterministically parked inside fetchQuotedContext when we disconnect.
     await waitFor(() => quoteRequested, 8000);
 
+    const failSpy = vi.spyOn(log, 'fail');
+    const infoSpy = vi.spyOn(log, 'info');
     const startedAt = Date.now();
     await h.bridge.disconnect();
-    // Cancellation lands immediately (batch breaks out at the abort), not
-    // after a timeout — and no terminal write is skipped: the batch never
-    // claimed, so the record stays queued and the next start replays it.
-    expect(Date.now() - startedAt).toBeLessThan(2000);
+    const elapsed = Date.now() - startedAt;
+    // Waited for the abandoned fetch to settle...
+    expect(elapsed).toBeGreaterThanOrEqual(500);
+    // ...but the batch itself broke out at the abort (no 3s-cap wait).
+    expect(elapsed).toBeLessThan(3000);
     expect(h.agent.runs).toHaveLength(0);
+    // The never-dispatched record stays queued → next start replays it.
     const onDisk = new InboundJournal(dir);
     await onDisk.load();
     expect(onDisk.list('oc_dm')[0]?.status).toBe('queued');
+    // Expected shutdown cancellation must not surface as an error/failure
+    // (评审六轮 P2 observability) — it is an info-level cancellation.
+    expect(
+      failSpy.mock.calls.some((c) => String((c[1] as Error | undefined)?.message ?? c[1]).includes('bridge-shutdown')),
+    ).toBe(false);
+    expect(
+      infoSpy.mock.calls.some((c) => c[0] === 'flush' && c[1] === 'cancelled-by-shutdown'),
+    ).toBe(true);
   }, 15_000);
+
+  it('stuck drain escalates to warnings but never flushes or returns early', async () => {
+    const dir = await mkdtempInbound();
+    const journal = new GatedClaimJournal(dir);
+    let release!: () => void;
+    journal.gate = new Promise<void>((r) => (release = r));
+    // Warn threshold well below the parking time so the escalation branch
+    // (the old silent flush-and-return path) is exercised.
+    const h = await startBridge({ journal, drainWarnMs: 300 });
+
+    await h.channel.handlers.message?.(message('stuck drain proof'));
+    await waitFor(() => journal.claimReached, 8000);
+
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const startedAt = Date.now();
+    const disconnecting = h.bridge.disconnect();
+    setTimeout(release, 1500);
+    await disconnecting;
+
+    expect(
+      warnSpy.mock.calls.filter((c) => c[0] === 'disconnect' && c[1] === 'drain-stuck').length,
+    ).toBeGreaterThanOrEqual(1);
+    // The warn did NOT turn into an early return: disconnect waited out the
+    // whole stuck period and the settled record is on disk.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1400);
+    const onDisk = new InboundJournal(dir);
+    await onDisk.load();
+    expect(onDisk.list('oc_dm')[0]?.status).toBe('terminal');
+    expect(onDisk.list('oc_dm')[0]?.terminalState).toBe('rejected');
+  }, 20_000);
 });
 
 describe('inbound journal review fixes (阻断 1/2)', () => {
