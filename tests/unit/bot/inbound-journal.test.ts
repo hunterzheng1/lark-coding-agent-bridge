@@ -136,3 +136,47 @@ describe('InboundJournal', () => {
     expect(j.list('oc_chat1')).toHaveLength(0);
   });
 });
+
+describe('InboundJournal recovery actions (recovery card)', () => {
+  async function seeded(dir: string): Promise<InboundJournal> {
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_u' }));
+    await j.markClaimed('oc_chat1', ['om_u'], 'run-lost');
+    // force uncertain
+    await j.recoverOnStartup();
+    return j;
+  }
+
+  it('markRedone settles the old record and journals a fresh queued copy', async () => {
+    const dir = await freshDir();
+    const j = await seeded(dir);
+    const rec = j.getRecord('oc_chat1', 'om_u');
+    expect(rec?.status).toBe('uncertain');
+
+    const nextId = await j.redo('oc_chat1', 'om_u');
+    expect(nextId).not.toBe('om_u');
+    expect(j.getRecord('oc_chat1', 'om_u')?.status).toBe('terminal');
+    expect(j.getRecord('oc_chat1', 'om_u')?.terminalState).toBe('redone');
+    const fresh = j.getRecord('oc_chat1', nextId!);
+    expect(fresh?.status).toBe('queued');
+    expect(fresh?.content).toBe(rec?.content);
+  });
+
+  it('markDismissed settles the record as dismissed; redo on settled record fails', async () => {
+    const dir = await freshDir();
+    const j = await seeded(dir);
+    await j.markDismissed('oc_chat1', 'om_u');
+    expect(j.getRecord('oc_chat1', 'om_u')?.terminalState).toBe('dismissed');
+    expect(await j.redo('oc_chat1', 'om_u')).toBeUndefined();
+  });
+
+  it('redo works on expired records too; unknown ids return undefined', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir, {}, () => Date.now());
+    await j.recordAccepted(accepted({ messageId: 'om_old', acceptedAt: Date.now() - 60 * 60_000 }));
+    await j.recoverOnStartup(); // expired (outside requeue window)
+    expect(j.getRecord('oc_chat1', 'om_old')?.status).toBe('expired');
+    expect(await j.redo('oc_chat1', 'om_old')).toBeTruthy();
+    expect(await j.redo('oc_chat1', 'om_nope')).toBeUndefined();
+  });
+});

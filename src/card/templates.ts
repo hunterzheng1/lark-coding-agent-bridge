@@ -217,3 +217,32 @@ function escapeMd(s: string): string {
 function escapeCode(s: string): string {
   return s.replace(/`/g, "'");
 }
+
+/**
+ * Recovery card for inbound journal leftovers (OPT-04 分片 4). Shown when a
+ * previous process died leaving a claimed-without-terminal (uncertain) or a
+ * stale queued (expired) record. Buttons dispatch unsigned `inbound.*`
+ * commands — access is enforced by the dispatcher's chat/user checks, the
+ * journal settles the record so a second click is a no-op.
+ */
+export function recoveryCard(input: {
+  status: 'uncertain' | 'expired';
+  messageId: string;
+  content: string;
+}): object {
+  const statusLine =
+    input.status === 'uncertain'
+      ? '上次进程中断，该任务的执行结果**未知**，未自动重跑。'
+      : '该消息在上次中断后滞留过久，未自动执行。';
+  const preview =
+    input.content.replace(/\s+/g, ' ').trim().slice(0, 120) || '(空内容)';
+  return shell('⚠️ 上次中断恢复', [
+    divMd(statusLine),
+    divMd(`任务内容：${preview}`),
+    HR,
+    actions([
+      { text: '🔁 重做任务', value: { cmd: 'inbound.redo', arg: input.messageId }, style: 'primary' },
+      { text: '忽略', value: { cmd: 'inbound.dismiss', arg: input.messageId } },
+    ]),
+  ]);
+}

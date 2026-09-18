@@ -175,9 +175,14 @@ describe('inbound journal end-to-end (OPT-04)', () => {
 
     const h = await startBridge({ journalDir: dir });
     await waitFor(
-      () => h.channel.sent.some((s) => (markdownOf(s) ?? '').includes('未自动重跑')),
+      () => h.channel.sent.some((s) => JSON.stringify(s.content).includes('未自动重跑')),
       6000,
     );
+    // The recovery notice is a structured card with redo/dismiss actions.
+    const card = h.channel.sent.find((s) => JSON.stringify(s.content).includes('未自动重跑'));
+    expect(JSON.stringify(card)).toContain('inbound.redo');
+    expect(JSON.stringify(card)).toContain('inbound.dismiss');
+    expect(JSON.stringify(card)).toContain('om_side_effect');
     // The uncertain task must not spawn a new run.
     await new Promise((r) => setTimeout(r, 200));
     expect(h.agent.runs).toHaveLength(0);

@@ -195,6 +195,51 @@ export class InboundJournal {
       .sort((a, b) => a.acceptedAt - b.acceptedAt);
   }
 
+  getRecord(scope: string, messageId: string): InboundRecord | undefined {
+    return this.records.get(key(scope, messageId));
+  }
+
+  /**
+   * Recovery-card "重做" (OPT-04): settle the old uncertain/expired record as
+   * `redone` and journal a fresh queued copy under a derived id, so the
+   * re-dispatched message runs through the normal claim → terminal
+   * lifecycle (with fresh policy checks at dispatch). Resolves the new
+   * messageId, or undefined when the record is missing/already settled.
+   */
+  async redo(scope: string, messageId: string): Promise<string | undefined> {
+    const record = this.records.get(key(scope, messageId));
+    if (!record) return undefined;
+    if (record.status !== 'uncertain' && record.status !== 'expired') return undefined;
+    record.status = 'terminal';
+    record.terminalState = 'redone';
+    record.settledAt = this.now();
+    const newId = `redo-${this.now()}-${messageId}`;
+    this.records.set(key(scope, newId), {
+      messageId: newId,
+      scope: record.scope,
+      chatId: record.chatId,
+      senderId: record.senderId,
+      content: record.content,
+      acceptedAt: this.now(),
+      status: 'queued',
+      ...(record.threadId ? { threadId: record.threadId } : {}),
+      ...(record.chatType ? { chatType: record.chatType } : {}),
+    });
+    await this.persistScope(scope);
+    return newId;
+  }
+
+  /** Recovery-card "忽略": settle an uncertain/expired record as dismissed. */
+  async markDismissed(scope: string, messageId: string): Promise<void> {
+    const record = this.records.get(key(scope, messageId));
+    if (!record) return;
+    if (record.status !== 'uncertain' && record.status !== 'expired') return;
+    record.status = 'terminal';
+    record.terminalState = 'dismissed';
+    record.settledAt = this.now();
+    await this.persistScope(scope);
+  }
+
   /**
    * Classify journal leftovers at startup. Queued records inside the
    * re-dispatch window are safe to run again (they never spawned an agent);
@@ -258,4 +303,29 @@ export class InboundJournal {
 
 function key(scope: string, messageId: string): string {
   return `${scope}\u0000${messageId}`;
+}
+
+/**
+ * Rebuild a replayable normalized message from a journal record — used by the
+ * startup recovery replay and the recovery card's 重做 button. Pass a
+ * different messageId when re-dispatching under a fresh identity.
+ */
+export function recoveryMessageFrom(record: InboundRecord, messageId = record.messageId): {
+  messageId: string;
+  chatId: string;
+  scope: string;
+  content: string;
+  senderId: string;
+  threadId?: string;
+  chatType: 'p2p' | 'group';
+} {
+  return {
+    messageId,
+    chatId: record.chatId,
+    scope: record.scope,
+    content: record.content,
+    senderId: record.senderId,
+    ...(record.threadId ? { threadId: record.threadId } : {}),
+    chatType: record.chatType ?? 'group',
+  };
 }

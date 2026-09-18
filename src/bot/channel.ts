@@ -18,6 +18,7 @@ import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
 import { renderCardBounded, type RunCardProgress } from '../card/run-renderer';
+import { recoveryCard } from '../card/templates';
 import { ResilientCardUpdater } from '../card/resilient-updater';
 import { SnapshotScheduler } from '../card/snapshot-scheduler';
 import {
@@ -324,7 +325,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             .send(
               record.chatId,
               {
-                markdown: `⚠️ 上次进程中断，消息「${previewContent(record.content)}」的执行结果未知，未自动重跑。可重新发送该任务，或 /doctor 查看日志。`,
+                card: recoveryCard({
+                  status: 'uncertain',
+                  messageId: record.messageId,
+                  content: record.content,
+                }),
               },
               record.threadId ? { replyInThread: true as const } : undefined,
             )
@@ -335,7 +340,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             .send(
               record.chatId,
               {
-                markdown: `⚠️ 消息「${previewContent(record.content)}」在上次中断后滞留过久，未自动执行，请重新发送。`,
+                card: recoveryCard({
+                  status: 'expired',
+                  messageId: record.messageId,
+                  content: record.content,
+                }),
               },
               record.threadId ? { replyInThread: true as const } : undefined,
             )
@@ -726,11 +735,6 @@ function recoveryMessage(record: InboundRecord): NormalizedMessage {
     mentionedBot: true,
     createTime: record.acceptedAt,
   } as unknown as NormalizedMessage;
-}
-
-function previewContent(content: string): string {
-  const compact = content.replace(/\s+/g, ' ').trim();
-  return compact.length > 40 ? `${compact.slice(0, 40)}…` : compact;
 }
 
 interface RunBatchDeps {

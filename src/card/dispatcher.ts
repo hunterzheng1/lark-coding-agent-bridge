@@ -2,6 +2,8 @@ import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuite
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import type { ChatModeCache } from '../bot/chat-mode-cache';
+import type { InboundJournal } from '../bot/inbound-journal';
+import { recoveryMessageFrom } from '../bot/inbound-journal';
 import type { PendingQueue } from '../bot/pending-queue';
 import type { ProcessPool } from '../bot/process-pool';
 import type { CallbackAuth } from './callback-auth';
@@ -31,7 +33,7 @@ export interface CardDispatchDeps {
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   thinkingHistory?: ThinkingHistoryStore;
-  inboundJournal?: { clearQueued(scope: string): Promise<void> };
+  inboundJournal?: InboundJournal;
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   agent: AgentAdapter;
@@ -87,6 +89,14 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
   const cmd = typeof payload.cmd === 'string' ? payload.cmd : '';
   if (cmd) {
+    // Recovery-card actions (OPT-04) need the pending queue, which command
+    // handlers don't hold — handle them right here. Unsigned like other
+    // built-in command buttons; chat/user access was already enforced above.
+    if (cmd === 'inbound.redo' || cmd === 'inbound.dismiss') {
+      const messageId = typeof payload.arg === 'string' ? payload.arg : '';
+      await handleInboundRecoveryAction(deps, scope, chatId, cmd, messageId);
+      return;
+    }
     if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
       return;
     }
@@ -146,10 +156,73 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   return;
 }
 
+/**
+ * Recovery-card button actions (OPT-04 分片 4). `inbound.redo` settles the
+ * journal record and re-dispatches its content through the normal pending →
+ * run flow under a fresh message id (fresh policy checks at dispatch);
+ * `inbound.dismiss` settles it without running. Both are idempotent — a
+ * second click on a settled record only answers "已处理过".
+ */
+async function handleInboundRecoveryAction(
+  deps: CardDispatchDeps,
+  scope: string,
+  chatId: string,
+  cmd: string,
+  messageId: string,
+): Promise<void> {
+  const journal = deps.inboundJournal;
+  const send = (markdown: string): void => {
+    void deps.channel.send(chatId, { markdown }).catch((err) => log.fail('inbound', err));
+  };
+  if (!journal || !messageId) {
+    send('恢复记录不可用（journal 未启用或缺少消息 id）。');
+    return;
+  }
+  const record = journal.getRecord(scope, messageId);
+  const actionable =
+    record && (record.status === 'uncertain' || record.status === 'expired');
+  if (!record || !actionable) {
+    send('该恢复记录已处理过。');
+    return;
+  }
+
+  if (cmd === 'inbound.dismiss') {
+    await journal.markDismissed(scope, messageId);
+    log.info('inbound', 'recovery-dismiss', { scope, messageId });
+    send('✓ 已忽略该恢复记录。');
+    return;
+  }
+
+  // inbound.redo
+  const newId = await journal.redo(scope, messageId);
+  if (!newId) {
+    send('该恢复记录已处理过。');
+    return;
+  }
+  const m = recoveryMessageFrom(record, newId);
+  const synthetic: NormalizedMessage = {
+    messageId: m.messageId,
+    chatId: m.chatId,
+    chatType: m.chatType === 'p2p' ? 'p2p' : 'group',
+    ...(m.threadId ? { threadId: m.threadId } : {}),
+    senderId: m.senderId,
+    senderName: undefined,
+    content: m.content,
+    rawContentType: 'text',
+    resources: [],
+    mentions: [],
+    mentionAll: false,
+    mentionedBot: true,
+    createTime: Date.now(),
+  } as unknown as NormalizedMessage;
+  deps.pending.push(scope, synthetic);
+  log.info('inbound', 'recovery-redo', { scope, messageId, newMessageId: newId });
+  send('🔁 已重新提交任务，按新消息处理。');
+}
+
 async function resolveScope(
   deps: CardDispatchDeps,
-): Promise<{ scope: string; threadId: string | undefined; mode: 'p2p' | 'group' | 'topic' }> {
-  const chatId = deps.evt.chatId;
+): Promise<{ scope: string; threadId: string | undefined; mode: 'p2p' | 'group' | 'topic' }> {  const chatId = deps.evt.chatId;
   const mode = await deps.chatModeCache.resolve(deps.channel, chatId);
   if (mode !== 'topic') {
     return { scope: chatId, threadId: undefined, mode };

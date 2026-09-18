@@ -2,6 +2,7 @@ import type { CardActionEvent } from '@larksuite/channel';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import type { ChatModeCache } from '../../../src/bot/chat-mode-cache.js';
+import { InboundJournal } from '../../../src/bot/inbound-journal.js';
 import { PendingQueue } from '../../../src/bot/pending-queue.js';
 import { CallbackAuth } from '../../../src/card/callback-auth.js';
 import { CallbackNonceStore } from '../../../src/card/callback-store.js';
@@ -115,6 +116,72 @@ describe('signed card callback dispatch', () => {
   });
 });
 
+
+// ─── OPT-04 分片 4: recovery card actions ───────────────────────────────────
+
+async function seedUncertain(h: Harness): Promise<void> {
+  await h.journal.recordAccepted({
+    messageId: 'om_side_effect',
+    scope: 'oc_group',
+    chatId: 'oc_group',
+    senderId: 'ou_operator',
+    content: 'possibly deployed task',
+    acceptedAt: Date.now(),
+    chatType: 'group',
+  });
+  await h.journal.markClaimed('oc_group', ['om_side_effect'], 'run-lost');
+  await h.journal.recoverOnStartup(); // claimed → uncertain
+}
+
+describe('recovery card actions (inbound.redo / inbound.dismiss)', () => {
+  it('redo settles the record and re-dispatches the content through the pending queue', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
+
+    // Old record settled, fresh queued record created.
+    const old = h.journal.getRecord('oc_group', 'om_side_effect');
+    expect(old?.status).toBe('terminal');
+    expect(old?.terminalState).toBe('redone');
+    const queued = h.pending.cancel('oc_group');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]?.content).toBe('possibly deployed task');
+    const newRecord = h.journal.list('oc_group').find((r) => r.messageId === queued[0]?.messageId);
+    expect(newRecord?.status).toBe('queued');
+  });
+
+  it('a second redo click is a no-op (record already settled)', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
+    expect(h.pending.cancel('oc_group')).toHaveLength(1);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_side_effect' });
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+    // A replied hint is sent instead.
+    expect(JSON.stringify(h.channel.sent)).toContain('已处理过');
+  });
+
+  it('dismiss settles the record without dispatching a run', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+
+    await h.dispatch({ cmd: 'inbound.dismiss', arg: 'om_side_effect' });
+
+    expect(h.journal.getRecord('oc_group', 'om_side_effect')?.terminalState).toBe('dismissed');
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('已忽略');
+  });
+
+  it('unknown or missing journal targets answer without throwing', async () => {
+    const h = await createHarness();
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_unknown' });
+    expect(JSON.stringify(h.channel.sent)).toContain('已处理过');
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+  });
+});
+
 type Harness = {
   tmp: TmpProfile;
   channel: FakeChannel;
@@ -125,6 +192,7 @@ type Harness = {
   controls: Controls;
   pending: PendingQueue;
   auth: CallbackAuth;
+  journal: InboundJournal;
   dispatch(value: Record<string, unknown>, formValue?: Record<string, unknown>): Promise<void>;
   token(
     action: string,
@@ -142,6 +210,7 @@ async function createHarness(
   const activeRuns = new ActiveRuns();
   const agent = new FakeAgentAdapter();
   const pending = new PendingQueue(60_000, () => {});
+  const journal = new InboundJournal(`${tmp.profile}/inbound`);
   const store = new CallbackNonceStore(`${tmp.profile}/callback-nonces.json`);
   const controls = {
     profile: 'claude',
@@ -175,7 +244,7 @@ async function createHarness(
   } as unknown as ChatModeCache;
   cleanups.push(async () => {
     pending.cancelAll();
-    await Promise.all([sessions.flush(), workspaces.flush(), store.flush()]);
+    await Promise.all([sessions.flush(), workspaces.flush(), store.flush(), journal.flush()]);
     await tmp.cleanup();
   });
 
@@ -189,6 +258,7 @@ async function createHarness(
     controls,
     pending,
     auth,
+    journal,
     token: (action, overrides = {}) => {
       nonce = overrides.nonce ?? `nonce-${action}`;
       return auth.sign({
@@ -212,6 +282,7 @@ async function createHarness(
         controls,
         pending,
         chatModeCache,
+        inboundJournal: journal,
         ...(opts.callbackAuth === false ? {} : { callbackAuth: auth }),
         callbackPolicyFingerprint: 'fp-1',
       }),
