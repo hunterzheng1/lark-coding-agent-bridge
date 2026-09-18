@@ -58,13 +58,13 @@
 | thinkingEvents | ✓ | ✓ | ✗ | claude/codebuddy 走 `src/agent/claude/stream-json.ts`（`block.type==='thinking'` 映射）；codex `src/agent/codex/jsonl.ts` 只映射 agent_message/命令/token_count，无 reasoning item |
 | incrementalText | ✓ | ✓ | ✓ | claude stream-json `text` delta；codex `agent_message` 增量与 `final_text` 分流 |
 | usageEvents | ✓ | ✓ | ✓ | 两侧 translator 均映射 token usage |
-| nativeHistory | ✓ | ✓ | ✗ | 与既有 `supportsNativeHistory` 一致（codex 按 threadId 续聊，无历史 provider） |
+| nativeHistory | ✓ | ✓ | ✓ | 评审二轮修正（`4840492`）：`/resume` 已通过 `codexHistoryProvider` 列出并恢复 Codex thread 历史，原 ✗ 声明与功能不符 |
 | inputRequest | ✗ | ✗ | ✗ | 三个后端在桥接器使用的 `-p`/exec 模式下均无已核验的结构化输入请求通道 |
 | toolApproval | ✗ | ✗ | ✗ | 同上；未核验前不得渲染审批按钮，也不得用 prompt 模拟审批 |
 | taskList | ✗ | ✗ | ✗ | 无结构化 plan/task 事件映射 |
 | steer | ✗ | ✗ | ✗ | 运行中补充消息维持既有"下一轮"排队语义 |
 
-评审修复（`bedbc7e`）：`supportsNativeHistory` 改为 `interactions.nativeHistory` 的派生值，能力声明只剩一个事实来源。已接线的消费点：`/thinking` 在 `thinkingEvents=false` 的后端上明确答复，且运行中有任务时提示当前运行尚未保存（OPT-06 关联）。"该 agent 不产生思考事件"，替代笼统的"暂无记录"。矩阵的契约测试（5 项）防止后续未经声明就开放交互控制。
+评审修复（`bedbc7e`）：`supportsNativeHistory` 改为 `interactions.nativeHistory` 的派生值，能力声明只剩一个事实来源；Codex `nativeHistory` 修正为 true。已接线的消费点：`/thinking` 在 `thinkingEvents=false` 的后端上明确答复，且运行中有任务时提示当前运行尚未保存（OPT-06 关联）。"该 agent 不产生思考事件"，替代笼统的"暂无记录"。矩阵的契约测试（5 项）防止后续未经声明就开放交互控制。
 
 ### 未实施：纵向交互闭环（规格第二分片）
 
