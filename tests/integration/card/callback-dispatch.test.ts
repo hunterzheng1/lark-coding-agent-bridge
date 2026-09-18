@@ -1,4 +1,5 @@
 import type { CardActionEvent } from '@larksuite/channel';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import type { ChatModeCache } from '../../../src/bot/chat-mode-cache.js';
@@ -441,3 +442,51 @@ function cardEvent(
     raw: formValue ? { action: { form_value: formValue } } : undefined,
   } as unknown as CardActionEvent;
 }
+
+describe('恢复卡持久化失败路径（评审三轮）', () => {
+  async function seedAndBreak(h: Harness): Promise<void> {
+    await seedUncertain(h);
+    // Break the journal dir AFTER seeding: in-memory record survives, disk fails.
+    const inDir = join(h.tmp.profile, 'inbound');
+    const { rm, writeFile } = await import('node:fs/promises');
+    await rm(inDir, { recursive: true, force: true });
+    await writeFile(inDir, 'occupied', 'utf8');
+  }
+
+  it('redo with a failing journal does NOT reset the session and asks to retry', async () => {
+    const h = await createHarness();
+    await h.journal.recordAccepted({
+      messageId: 'om_unc',
+      scope: 'oc_group',
+      chatId: 'oc_group',
+      senderId: 'ou_alice',
+      content: 'original task text',
+      acceptedAt: Date.now(),
+      chatType: 'group',
+    });
+    await h.journal.markClaimed('oc_group', ['om_unc'], 'run-lost');
+    await h.journal.recoverOnStartup();
+    h.sessions.set('oc_group', 'sess-live', 'C:/cwd');
+    await seedAndBreak(h);
+
+    await h.dispatch({ cmd: 'inbound.redo', arg: 'om_unc' }, undefined, 'ou_alice');
+
+    // Old session untouched — a failed write must not destroy it.
+    expect(h.sessions.getRaw('oc_group')?.sessionId).toBe('sess-live');
+    expect(h.pending.cancel('oc_group')).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('暂时无法写入');
+  });
+
+  it('dismiss with a failing journal asks to retry instead of claiming success', async () => {
+    const h = await createHarness();
+    await seedUncertain(h);
+    await seedAndBreak(h);
+
+    await h.dispatch({ cmd: 'inbound.dismiss', arg: 'om_side_effect' }, undefined, 'ou_alice');
+
+    expect(JSON.stringify(h.channel.sent)).toContain('暂时无法写入');
+    expect(JSON.stringify(h.channel.sent)).not.toContain('已忽略');
+    // Record still actionable.
+    expect(h.journal.getRecord('oc_group', 'om_side_effect')?.status).toBe('uncertain');
+  });
+});

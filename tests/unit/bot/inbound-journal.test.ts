@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -280,5 +280,32 @@ describe('InboundJournal 并发与持久化失败回滚（评审二轮）', () =
 
     expect(await j.redo('oc_chat1', 'om_r')).toBeUndefined();
     expect(j.getRecord('oc_chat1', 'om_r')?.status).toBe('uncertain');
+  });
+});
+
+describe('InboundJournal 写入失败后重投（评审三轮）', () => {
+  it('persist failure rolls back the reservation; a later delivery records cleanly', async () => {
+    const dir = await freshDir();
+    const j = new InboundJournal(dir);
+    await j.recordAccepted(accepted({ messageId: 'om_retry' }));
+    // Break the journal dir so the NEXT write fails.
+    await rm(dir, { recursive: true, force: true });
+    await writeFile(dir, 'occupied', 'utf8');
+
+    // Deliver a new message — persist fails, reservation must be rolled back.
+    expect(
+      await j.recordAccepted(accepted({ messageId: 'om_new', content: 'fresh task' })),
+    ).toBe('failed');
+    // The failed reservation must not shadow a later delivery of the same id.
+    expect(j.getRecord('oc_chat1', 'om_new')).toBeUndefined();
+
+    // Journal recovers (dir writable again) — the same id is NOT a duplicate.
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'keep'), 'dir-holder', 'utf8');
+    expect(
+      await j.recordAccepted(accepted({ messageId: 'om_new', content: 'fresh task' })),
+    ).toBe('recorded');
+    expect(j.getRecord('oc_chat1', 'om_new')?.content).toBe('fresh task');
   });
 });
